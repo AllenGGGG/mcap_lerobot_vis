@@ -38,10 +38,22 @@ ln -s /path/to/your/recording_0.mcap data/episode1/recording/recording_0.mcap
 streamlit run app.py
 ```
 
+指定监听地址和端口（`0.0.0.0` 表示局域网内其他设备也能访问）：
+
+```bash
+streamlit run app.py --server.address 0.0.0.0 --server.port 8501
+```
+
 默认数据目录是 `/ssd/data`，也可以用 `--data-path` 指定（注意 `--` 分隔符，把参数传给脚本本身而不是 streamlit）：
 
 ```bash
 streamlit run app.py -- --data-path /your/mcap/root
+```
+
+两者可以一起用：
+
+```bash
+streamlit run app.py --server.address 0.0.0.0 --server.port 8501 -- --data-path /your/mcap/root
 ```
 
 打开侧边栏 "mcap root dir" 可以再改一次（默认值就是上面这个 root 路径），选择 episode 即可。
