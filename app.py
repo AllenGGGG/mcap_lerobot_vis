@@ -634,59 +634,17 @@ t = st.session_state.t
 @st.fragment
 def _playback_fragment():
     st.markdown("## Img/state/action")
-    col1, col2, col3 = st.columns([1, 1, 2])
-    with col1:
-        if st.button("▶ Play"):
-            st.session_state.playing = True
-    with col2:
-        if st.button("⏸ Pause"):
-            st.session_state.playing = False
-    with col3:
-        st.session_state.fps = st.slider("FPS", 5, 60, st.session_state.fps)
+    # 用一个按钮在 Play/Pause 之间切换，而不是同时摆两个按钮——
+    # 当前状态已经决定了哪个动作有意义，没必要两个都常驻显示。
+    toggle_label = "⏸ Pause" if st.session_state.playing else "▶ Play"
+    if st.button(toggle_label, use_container_width=True):
+        st.session_state.playing = not st.session_state.playing
+    st.session_state.fps = st.slider("FPS", 5, 60, st.session_state.fps)
     t_manual = st.slider("Step", 0, max(T - 1, 0), st.session_state.t)
     if t_manual != st.session_state.t:
         st.session_state.t = t_manual
         st.session_state.playing = False
     t = st.session_state.t
-
-    c1, c2, c3 = st.columns(3)
-    for col, cam_name in [
-        (c1, "left_wrist"),
-        (c2, "head"),
-        (c3, "right_wrist"),
-    ]:
-        with col:
-            frames = cameras.get(cam_name, [None] * T)
-            img = frames[t] if T > 0 and t < len(frames) else None
-            raw_idx = camera_indices.get(cam_name, [None] * T)[t] if T > 0 else None
-            total_raw = camera_counts.get(cam_name, 0)
-            if img is not None and raw_idx is not None:
-                st.image(
-                    img,
-                    caption=f"{cam_name} index {raw_idx + 1}/{total_raw} ({IMAGE_RESIZE_SIZE[0]}x{IMAGE_RESIZE_SIZE[1]})",
-                    output_format="JPEG",
-                )
-            elif img is not None:
-                st.image(
-                    img,
-                    caption=f"{cam_name} index unknown/{total_raw} ({IMAGE_RESIZE_SIZE[0]}x{IMAGE_RESIZE_SIZE[1]})",
-                    output_format="JPEG",
-                )
-            else:
-                # missing：即使超出对齐容差没有可用帧，也把"最近是第几帧、偏差多少 ms"标出来，
-                # 这样能区分是真丢帧，还是这个相机本身采集频率就比 master 低。
-                nearest_idx_list = camera_raw_indices.get(cam_name, [])
-                nearest_delta_list = camera_raw_delta_ms.get(cam_name, [])
-                nearest_idx = nearest_idx_list[t] if T > 0 and t < len(nearest_idx_list) else None
-                nearest_delta = nearest_delta_list[t] if T > 0 and t < len(nearest_delta_list) else None
-                if nearest_idx is not None and nearest_idx >= 0 and nearest_delta is not None:
-                    st.warning(
-                        f"{cam_name} missing at step {t} "
-                        f"(nearest raw frame index {nearest_idx + 1}/{total_raw}, {nearest_delta:+.1f} ms off)"
-                    )
-                else:
-                    st.warning(f"{cam_name} missing at step {t} (no frames recorded, total {total_raw})")
-
     # =========================================================
     # State / Action selection
     # =========================================================
@@ -738,10 +696,55 @@ def _playback_fragment():
             st.session_state[multiselect_key] = [
                 label for label in st.session_state[multiselect_key] if label in labels
             ]
-    # multiselect 控件本身挪到图表下面显示，这里先直接读 session_state 里已经
-    # 规范化过的选择结果来画图，不需要先调用 st.multiselect 才能拿到这个值。
-    selected_dims = st.session_state[multiselect_key]
-    # =========================================================
+    # Play/Pause/FPS/Step 和这个 multiselect 放在一起，算作一个统一的控制区域，
+    # 图片和图表都在它下面，用的是这里选出来的 selected_dims。
+    selected_dims = st.multiselect(
+        "Select state / action dims",
+        labels,
+        key=multiselect_key,
+        disabled=st.session_state.playing,
+    )
+    st.session_state.selected_dims = selected_dims
+
+
+    c1, c2, c3 = st.columns(3)
+    for col, cam_name in [
+        (c1, "left_wrist"),
+        (c2, "head"),
+        (c3, "right_wrist"),
+    ]:
+        with col:
+            frames = cameras.get(cam_name, [None] * T)
+            img = frames[t] if T > 0 and t < len(frames) else None
+            raw_idx = camera_indices.get(cam_name, [None] * T)[t] if T > 0 else None
+            total_raw = camera_counts.get(cam_name, 0)
+            if img is not None and raw_idx is not None:
+                st.image(
+                    img,
+                    caption=f"{cam_name} index {raw_idx + 1}/{total_raw} ({IMAGE_RESIZE_SIZE[0]}x{IMAGE_RESIZE_SIZE[1]})",
+                    output_format="JPEG",
+                )
+            elif img is not None:
+                st.image(
+                    img,
+                    caption=f"{cam_name} index unknown/{total_raw} ({IMAGE_RESIZE_SIZE[0]}x{IMAGE_RESIZE_SIZE[1]})",
+                    output_format="JPEG",
+                )
+            else:
+                # missing：即使超出对齐容差没有可用帧，也把"最近是第几帧、偏差多少 ms"标出来，
+                # 这样能区分是真丢帧，还是这个相机本身采集频率就比 master 低。
+                nearest_idx_list = camera_raw_indices.get(cam_name, [])
+                nearest_delta_list = camera_raw_delta_ms.get(cam_name, [])
+                nearest_idx = nearest_idx_list[t] if T > 0 and t < len(nearest_idx_list) else None
+                nearest_delta = nearest_delta_list[t] if T > 0 and t < len(nearest_delta_list) else None
+                if nearest_idx is not None and nearest_idx >= 0 and nearest_delta is not None:
+                    st.warning(
+                        f"{cam_name} missing at step {t} "
+                        f"(nearest raw frame index {nearest_idx + 1}/{total_raw}, {nearest_delta:+.1f} ms off)"
+                    )
+                else:
+                    st.warning(f"{cam_name} missing at step {t} (no frames recorded, total {total_raw})")
+
     # Plotly View (joint vis) — 一张图，但每个 topic 的丢帧竖线各占独立的颜色+横向车道，
     # 避免"哪个 topic 在这段时间丢了"被混在一条通用红线里看不出来。合并到上面
     # "img/state/action" 一个标题下，这里不再单独起标题。
@@ -825,13 +828,6 @@ def _playback_fragment():
         fig_plotly.update_layout(hovermode="x")
         fig_plotly.update_xaxes(showspikes=True, spikemode="across", spikesnap="cursor", showline=True)
     st.plotly_chart(fig_plotly, use_container_width=True)
-    selected_dims = st.multiselect(
-        "Select state / action dims",
-        labels,
-        key=multiselect_key,
-        disabled=st.session_state.playing,
-    )
-    st.session_state.selected_dims = selected_dims
 
     # Play 期间的自增+rerun 放在 fragment 内部：st.rerun() 在 fragment 里默认只重跑
     # fragment 本身，不会带动全页重新执行（下面的图表/表格不受影响）。

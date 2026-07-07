@@ -52,8 +52,8 @@ streamlit run app.py -- --data-path /your/mcap/root
 
 页面从上到下依次是：
 
-- **Playback**：播放/暂停/拖动 step，三个相机画面按 step 对齐显示（Play 期间只有这部分刷新，不会拖慢下面的图表）。
-- **State / Action (Plotly)**：勾选的 state/action 维度曲线；丢帧处画竖线标注，每个 topic 的竖线各占独立的颜色和横向车道，避免不同 topic 的丢帧混在一起看不清。
+- **Playback**：一个 Play/Pause 切换按钮 + FPS 拖动条 + Step 拖动条，再往下是 "Select state / action dims" 勾选框，然后是三个相机画面按 step 对齐显示（Play 期间只有这部分刷新，不会拖慢下面的图表）。
+- **State / Action (Plotly)**：上面勾选的 state/action 维度曲线；丢帧处画竖线标注，每个 topic 的竖线各占独立的颜色和横向车道，避免不同 topic 的丢帧混在一起看不清。
 - **Image Health**：三个相机各自的发布频率统计、丢帧次数/帧数、`coverage`（实际频率 / 相机标称 30Hz）。
 - **Image Gap 明细**：每个相机具体丢在哪个 step 区间、丢了多少帧，按丢帧数从大到小排——想核实 Image Health 里的数字，把 Playback 的 Step 滑条拖到这里列出的区间就能直接看到对应的 "missing" 提示。
 - **Joint Health**：state/action 各 topic 的同类统计，`coverage` 按关节/pose/target 标称 100Hz 折算。
