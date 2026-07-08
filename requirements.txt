@@ -5,3 +5,4 @@ matplotlib>=3.10
 plotly>=6.8
 mcap>=1.4
 mcap-ros2-support>=0.5.7
+pandas>=2.2

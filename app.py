@@ -1,3 +1,4 @@
+import pyarrow  # noqa: F401 — must be first; forces full init before narwhals/plotly touch pa.Table
 import argparse
 import os
 import glob
@@ -27,7 +28,7 @@ def _parse_args():
     """支持 `streamlit run app.py -- --data-path /your/data` 指定数据目录，
     不传就用默认值；用 parse_known_args 避免跟 Streamlit 自己的参数冲突。"""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-path", default="/ssd/data", help="mcap root dir")
+    parser.add_argument("--data-path", default="test", help="mcap root dir")
     args, _ = parser.parse_known_args(sys.argv[1:])
     return args
 
@@ -41,16 +42,20 @@ DEFAULT_CAMERA_TOPICS = {
     "head": "/camera_head/color/image_raw/compressed",
     "right_wrist": "/camera_right_wrist/color/image_raw/compressed",
 }
-DEFAULT_STATE_TOPICS = ["/left_current_pose", "/right_current_pose"]
+DEFAULT_STATE_TOPICS = ["/left_current_pose", "/right_current_pose", "/body_current_pose"]
 DEFAULT_ACTION_TOPICS = ["/left_current_target", "/right_current_target"]
+DEFAULT_HAND_TOPICS = ["/left_hand_controller/target_percent", "/right_hand_controller/target_percent"]
 # 相机画面统一 resize 到的尺寸 (width, height)，VLA 模型输入常用 224x224
 IMAGE_RESIZE_SIZE = (224, 224)
 # "Select state / action dims" 多选框默认选中哪些 topic 下的维度
-DEFAULT_DIM_TOPIC_PREFIXES = ("/left_current_pose", "/right_current_pose")
+DEFAULT_DIM_TOPIC_PREFIXES = ("/left_current_pose", "/right_current_pose", "/body_current_pose")
 # 标称频率：仅用于 Data Health 表里的"整体是否达标" coverage 对比，不参与逐 step 缺帧判定
 # （逐 step 判定继续用各 topic 自己的自适应容差，见 _alignment_tolerance_ns）
 NOMINAL_HZ_CAMERA = 30
 NOMINAL_HZ_JOINT = 100
+NOMINAL_HZ_HAND = 10
+# 手控 session 间隔阈值：两条消息之间超过此值视为不同 session（session 间静默不是丢帧）
+SESSION_GAP_NS = 300_000_000  # 300 ms
 # 缺帧容差倍数：相邻/最近邻时间差超过 (该 topic 自适应周期 × 这个倍数) 就判定为缺帧
 GAP_TOLERANCE_MULTIPLIER = 1.5
 # Plotly 图上最多渲染多少段丢帧竖线，避免极端情况下卡顿
@@ -207,6 +212,47 @@ def _alignment_tolerance_ns(source_times, target_times):
     return int(max(periods) * GAP_TOLERANCE_MULTIPLIER)
 
 
+def _hand_session_analysis(source_times, master_times):
+    """手控 topic session 分析。手控数据按操作片段发布，session 间静默不算丢帧。
+
+    返回 (valid_mask, active_mask)：
+      valid_mask  [T] bool：有有效插值数据（session 内且距最近消息 ≤ intra_tol）
+      active_mask [T] bool：处于某个 session 活跃窗口内（用于 coverage 和丢帧判定）
+    """
+    src = np.array(source_times, dtype=np.int64)
+    mst = np.array(master_times, dtype=np.int64)
+    T_len = len(mst)
+    if len(src) == 0:
+        return np.zeros(T_len, dtype=bool), np.zeros(T_len, dtype=bool)
+    # 按 SESSION_GAP_NS 切割成 session
+    if len(src) > 1:
+        gaps = np.diff(src)
+        breaks = np.where(gaps > SESSION_GAP_NS)[0]
+        s_starts = np.concatenate([[0], breaks + 1])
+        s_ends = np.concatenate([breaks, [len(src) - 1]])
+        intra_diffs = gaps[gaps <= SESSION_GAP_NS]
+    else:
+        s_starts, s_ends = np.array([0]), np.array([0])
+        intra_diffs = np.array([], dtype=np.int64)
+    # 按压内容差：intra 消息间隔中位数 × 1.5；fallback 取标称半周期与 session 间隔的一半中的较小值，
+    # 防止单条消息的 active 窗口跨越到下一个按压的范围内。
+    intra_tol = (int(np.median(intra_diffs) * 1.5) if len(intra_diffs) > 0
+                 else min(round(1e9 / NOMINAL_HZ_HAND), SESSION_GAP_NS // 2))
+    # active 窗口：每个 session 的 [t_start - intra_tol, t_end + intra_tol]
+    active_mask = np.zeros(T_len, dtype=bool)
+    for si, ei in zip(s_starts, s_ends):
+        lo = np.searchsorted(mst, int(src[si]) - intra_tol)
+        hi = np.searchsorted(mst, int(src[ei]) + intra_tol, side='right')
+        active_mask[lo:hi] = True
+    # valid = active 且距最近消息 ≤ intra_tol
+    right = np.searchsorted(src, mst)
+    left = np.clip(right - 1, 0, len(src) - 1)
+    right = np.clip(right, 0, len(src) - 1)
+    dist = np.minimum(np.abs(mst - src[left]), np.abs(src[right] - mst))
+    valid_mask = active_mask & (dist <= intra_tol)
+    return valid_mask, active_mask
+
+
 def _nearest_alignment(source_times, target_times, tolerance_ns):
     """返回 (idx, delta_ms, valid, raw_idx, raw_delta_ms)。
     idx/delta_ms 是超过容差就置为无效(-1/NaN)的版本，用于对齐 state/action 数值。
@@ -242,7 +288,7 @@ def _nearest_alignment(source_times, target_times, tolerance_ns):
 
 def _is_xyzw_display_field(key):
     """用于 "Select state / action dims" 多选框的过滤：只显示 x/y/z/w 分量。"""
-    return key in ("x", "y", "z", "w") or key.endswith((".x", ".y", ".z", ".w"))
+    return key in ("x", "y", "z", "w", "data") or key.endswith((".x", ".y", ".z", ".w", ".data"))
 
 
 def _header_stamp_ns(msg):
@@ -376,8 +422,8 @@ def _topic_stats(times):
 
 
 @st.cache_data(max_entries=2, show_spinner="Decoding mcap file...")
-def load_episode(mcap_path, camera_topics: dict, state_topics: tuple, action_topics: tuple):
-    parser_cache_version = 11
+def load_episode(mcap_path, camera_topics: dict, state_topics: tuple, action_topics: tuple, hand_topics: tuple = ()):
+    parser_cache_version = 13
     camera_data = {name: [] for name in camera_topics}
     camera_times = {name: [] for name in camera_topics}
     signal_series = {}  # topic -> [(t_ns, flat_dict), ...]
@@ -488,34 +534,52 @@ def load_episode(mcap_path, camera_topics: dict, state_topics: tuple, action_top
         camera_raw_indices[cam_name] = [int(i) for i in raw_idx]
         camera_raw_delta_ms[cam_name] = [float(v) for v in raw_delta_ms]
 
+    hand_topics_set = frozenset(hand_topics)
+
     def build_matrix(topics):
         names, columns = [], []
         masks = {}
+        active_masks = {}
         for topic in topics:
             series = signal_series.get(topic, [])
             if not series:
                 continue
             times_arr = np.array([t for t, _ in series], dtype=np.int64)
-            tolerance_ns = _alignment_tolerance_ns(times_arr, master_times)
-            idx, _, valid, _, _ = _nearest_alignment(times_arr, master_times, tolerance_ns)
-            masks[topic] = valid
             all_keys = sorted({key for _, flat in series for key in flat.keys()})
-            if not all_keys:
-                continue
-            for key in all_keys:
-                names.append(f"{topic}.{key}" if key else topic)
-                raw_vals = np.array([flat.get(key, 0.0) for _, flat in series], dtype=float)
-                aligned_vals = np.zeros(T, dtype=float)
-                valid_idx = valid & (idx >= 0)
-                aligned_vals[valid_idx] = raw_vals[idx[valid_idx]]
-                columns.append(aligned_vals)
+            if topic in hand_topics_set:
+                valid, active = _hand_session_analysis(times_arr, master_times)
+                masks[topic] = valid    # 用于 stats 里检测按压期间的真实丢帧
+                active_masks[topic] = active
+                if not all_keys:
+                    continue
+                for key in all_keys:
+                    names.append(f"{topic}.{key}" if key else topic)
+                    raw_vals = np.array([flat.get(key, 0.0) for _, flat in series], dtype=float)
+                    # np.interp 边界外会外推端点值，但 active 窗口外随即被覆盖为 0
+                    interp_vals = np.interp(master_times.astype(float), times_arr.astype(float), raw_vals)
+                    interp_vals[~active] = 0.0  # 按压之外填 0
+                    columns.append(interp_vals)
+            else:
+                tolerance_ns = _alignment_tolerance_ns(times_arr, master_times)
+                idx, _, valid, _, _ = _nearest_alignment(times_arr, master_times, tolerance_ns)
+                masks[topic] = valid
+                if not all_keys:
+                    continue
+                for key in all_keys:
+                    names.append(f"{topic}.{key}" if key else topic)
+                    raw_vals = np.array([flat.get(key, 0.0) for _, flat in series], dtype=float)
+                    aligned_vals = np.zeros(T, dtype=float)
+                    valid_idx = valid & (idx >= 0)
+                    aligned_vals[valid_idx] = raw_vals[idx[valid_idx]]
+                    columns.append(aligned_vals)
         if not columns:
-            return np.zeros((T, 0)), [], masks
-        return np.stack(columns, axis=1), names, masks
+            return np.zeros((T, 0)), [], masks, active_masks
+        return np.stack(columns, axis=1), names, masks, active_masks
 
-    state, state_names, state_masks = build_matrix(state_topics)
-    action, action_names, action_masks = build_matrix(action_topics)
+    state, state_names, state_masks, state_active = build_matrix(state_topics)
+    action, action_names, action_masks, action_active = build_matrix(action_topics)
     signal_masks = {**state_masks, **action_masks}
+    hand_active_masks = {**state_active, **action_active}
     camera_stats = {}
     camera_gap_spans = {}
     for name in camera_times:
@@ -528,12 +592,26 @@ def load_episode(mcap_path, camera_topics: dict, state_topics: tuple, action_top
     for topic, series in signal_series.items():
         times = [t for t, _ in series]
         valid_mask = signal_masks.get(topic)
-        spans = _missing_runs(~valid_mask) if valid_mask is not None else []
-        signal_stats[topic] = _health_row(times, spans, NOMINAL_HZ_JOINT)
+        if topic in hand_topics_set:
+            active_mask = hand_active_masks.get(topic)
+            # 丢帧：按压期间距最近消息超过 intra_tol 的 master 步
+            # valid_mask = active & close；active & ~valid = active but not close
+            if active_mask is not None and valid_mask is not None:
+                intra_missing = active_mask & ~valid_mask
+            else:
+                intra_missing = np.zeros(T, dtype=bool)
+            spans = _missing_runs(intra_missing)
+            row = _health_row(times, spans, NOMINAL_HZ_HAND)
+            # coverage = session 活跃时间占比（不是 source_hz/nominal）
+            if active_mask is not None and len(active_mask) > 0:
+                row["coverage"] = float(np.sum(active_mask)) / len(active_mask)
+            signal_stats[topic] = row
+        else:
+            spans = _missing_runs(~valid_mask) if valid_mask is not None else []
+            signal_stats[topic] = _health_row(times, spans, NOMINAL_HZ_JOINT)
         if spans:
             all_keys = sorted({key for _, flat in series for key in flat.keys()})
             if all_keys:
-                # gap 是按整个 topic 的原生时间线算的，同一 topic 下所有字段共享同一份 span。
                 for key in all_keys:
                     signal_gap_spans[f"{topic}.{key}"] = spans
             else:
@@ -580,14 +658,18 @@ with st.sidebar.expander("Topic 配置", expanded=False):
     right_wrist_topic = st.text_input("right_wrist topic", DEFAULT_CAMERA_TOPICS["right_wrist"])
     state_topics_str = st.text_input("state topics (逗号分隔)", ",".join(DEFAULT_STATE_TOPICS))
     action_topics_str = st.text_input("action topics (逗号分隔)", ",".join(DEFAULT_ACTION_TOPICS))
+    hand_topics_str = st.text_input("hand topics (逗号分隔)", ",".join(DEFAULT_HAND_TOPICS))
 camera_topics = {
     "left_wrist": left_wrist_topic,
     "head": head_topic,
     "right_wrist": right_wrist_topic,
 }
 state_topics = tuple(t.strip() for t in state_topics_str.split(",") if t.strip())
-action_topics = tuple(t.strip() for t in action_topics_str.split(",") if t.strip())
-data = load_episode(mcap_path, camera_topics, state_topics, action_topics)
+hand_topics = tuple(t.strip() for t in hand_topics_str.split(",") if t.strip())
+# hand_topics 附加在 action_topics 末尾，使其被 load_episode 一并读取；
+# load_episode 内部通过 hand_topics_set 识别并走插值分支，列出现在 action 矩阵中。
+action_topics = tuple(t.strip() for t in action_topics_str.split(",") if t.strip()) + hand_topics
+data = load_episode(mcap_path, camera_topics, state_topics, action_topics, hand_topics)
 state = data["state"]
 action = data["action"]
 state_names = data["state_names"]
