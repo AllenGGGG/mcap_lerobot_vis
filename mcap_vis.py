@@ -700,7 +700,9 @@ if st.session_state.current_episode_key != episode_id:
 # Session state
 # =========================================================
 if "t" not in st.session_state:
-    st.session_state.t = 0
+    head_frames = cameras.get("head", [])
+    first_real = next((i for i, img in enumerate(head_frames) if img is not None), 0)
+    st.session_state.t = first_real
 if "playing" not in st.session_state:
     st.session_state.playing = False
 if "fps" not in st.session_state:
@@ -719,8 +721,9 @@ def _playback_fragment():
     # 用一个按钮在 Play/Pause 之间切换，而不是同时摆两个按钮——
     # 当前状态已经决定了哪个动作有意义，没必要两个都常驻显示。
     toggle_label = "⏸ Pause" if st.session_state.playing else "▶ Play"
-    if st.button(toggle_label, use_container_width=True):
+    if st.button(toggle_label, width="stretch"):
         st.session_state.playing = not st.session_state.playing
+        st.rerun(scope="fragment")
     st.session_state.fps = st.slider("FPS", 5, 60, st.session_state.fps)
     t_manual = st.slider("Step", 0, max(T - 1, 0), st.session_state.t)
     if t_manual != st.session_state.t:
@@ -832,94 +835,84 @@ def _playback_fragment():
     # "img/state/action" 一个标题下，这里不再单独起标题。
     # =========================================================
 
-    def _label_topic(label):
-        return label[2:].split(".", 1)[0]
+    if not st.session_state.playing:
+        def _label_topic(label):
+            return label[2:].split(".", 1)[0]
 
-    topics_in_view = [
-        tpc for tpc in (list(state_topics) + list(action_topics)) if any(_label_topic(l) == tpc for l in selected_dims)
-    ]
-    _GAP_COLOR_PALETTE = [
-        "rgb(220, 38, 38)",
-        "rgb(37, 99, 235)",
-        "rgb(217, 119, 6)",
-        "rgb(5, 150, 105)",
-        "rgb(147, 51, 234)",
-    ]
-    n_lanes = max(len(topics_in_view), 1)
-    lane_height = (0.95 - 0.05) / n_lanes
-    topic_style = {
-        tpc: {
-            "y0": 0.05 + i * lane_height,
-            "y1": 0.05 + (i + 1) * lane_height,
-            "color": _GAP_COLOR_PALETTE[i % len(_GAP_COLOR_PALETTE)],
+        topics_in_view = [
+            tpc for tpc in (list(state_topics) + list(action_topics)) if any(_label_topic(l) == tpc for l in selected_dims)
+        ]
+        _GAP_COLOR_PALETTE = [
+            "rgb(220, 38, 38)",
+            "rgb(37, 99, 235)",
+            "rgb(217, 119, 6)",
+            "rgb(5, 150, 105)",
+            "rgb(147, 51, 234)",
+        ]
+        n_lanes = max(len(topics_in_view), 1)
+        lane_height = (0.95 - 0.05) / n_lanes
+        topic_style = {
+            tpc: {
+                "y0": 0.05 + i * lane_height,
+                "y1": 0.05 + (i + 1) * lane_height,
+                "color": _GAP_COLOR_PALETTE[i % len(_GAP_COLOR_PALETTE)],
+            }
+            for i, tpc in enumerate(topics_in_view)
         }
-        for i, tpc in enumerate(topics_in_view)
-    }
 
-    gap_spans_by_topic = {}
-    for label in selected_dims:
-        if not label.startswith(("S:", "A:")):
-            continue
-        series_name = label[2:]
-        tpc = _label_topic(label)
-        seen_in_topic = {(s["x0"], s["x1"]) for s in gap_spans_by_topic.get(tpc, [])}
-        for span in signal_gap_spans.get(series_name, [])[:MAX_RENDERED_GAPS]:
-            key = (span["x0"], span["x1"])
-            if key in seen_in_topic:
-                # 同一 topic 下多个字段(x/y/z)共享同一份 gap，只画一次线，避免重叠的线叠加浪费。
+        gap_spans_by_topic = {}
+        for label in selected_dims:
+            if not label.startswith(("S:", "A:")):
                 continue
-            seen_in_topic.add(key)
-            gap_spans_by_topic.setdefault(tpc, []).append(span)
+            series_name = label[2:]
+            tpc = _label_topic(label)
+            seen_in_topic = {(s["x0"], s["x1"]) for s in gap_spans_by_topic.get(tpc, [])}
+            for span in signal_gap_spans.get(series_name, [])[:MAX_RENDERED_GAPS]:
+                key = (span["x0"], span["x1"])
+                if key in seen_in_topic:
+                    continue
+                seen_in_topic.add(key)
+                gap_spans_by_topic.setdefault(tpc, []).append(span)
 
-    plot_x = np.arange(T)
-    fig_plotly = go.Figure()
-    # 没有数据的 step 在 build_matrix 里已经被置成了 0，这里直接画原始值就行——
-    # 曲线会在缺数据的地方自然掉到 0，是否"缺数据"完全靠下面的竖线来标注，
-    # 不再额外把这段区间 NaN 掉断线。
-    for i in range(D_state):
-        label = f"S:{state_names[i]}"
-        if label in selected_dims:
-            fig_plotly.add_trace(go.Scatter(x=plot_x, y=state[:, i], name=label))
-    for i in range(D_action):
-        label = f"A:{action_names[i]}"
-        if label in selected_dims:
-            fig_plotly.add_trace(go.Scatter(x=plot_x, y=action[:, i], name=label, line=dict(dash="dot")))
-    # 竖线直接用真实的 x0/x1（master step）画，和曲线上被置 0 的缺数据区域用的
-    # 是完全相同的坐标（同一份 valid_mask 算出来的），保证两者永远对得上。
-    for tpc, spans in gap_spans_by_topic.items():
-        style = topic_style[tpc]
-        _add_gap_lines(
-            fig_plotly,
-            spans[:MAX_RENDERED_GAPS],
-            y0=style["y0"],
-            y1=style["y1"],
-            color=style["color"],
-            label_prefix=f"{tpc} ",
+        plot_x = np.arange(T)
+        fig_plotly = go.Figure()
+        for i in range(D_state):
+            label = f"S:{state_names[i]}"
+            if label in selected_dims:
+                fig_plotly.add_trace(go.Scatter(x=plot_x, y=state[:, i], name=label))
+        for i in range(D_action):
+            label = f"A:{action_names[i]}"
+            if label in selected_dims:
+                fig_plotly.add_trace(go.Scatter(x=plot_x, y=action[:, i], name=label, line=dict(dash="dot")))
+        for tpc, spans in gap_spans_by_topic.items():
+            style = topic_style[tpc]
+            _add_gap_lines(
+                fig_plotly,
+                spans[:MAX_RENDERED_GAPS],
+                y0=style["y0"],
+                y1=style["y1"],
+                color=style["color"],
+                label_prefix=f"{tpc} ",
+            )
+        fig_plotly.add_vline(x=t, line_color="red", line_width=2)
+        fig_plotly.update_layout(
+            height=350,
+            dragmode="select",
+            xaxis_title="Step",
+            hovermode="x",
         )
-    fig_plotly.update_layout(
-        height=350,
-        dragmode="select",
-        xaxis_title="Step",
-    )
-    if st.session_state.playing:
-        current_x = t
-        fig_plotly.add_vline(x=current_x, line_color="red", line_width=2)
-        fig_plotly.update_layout(hovermode=False)
-        fig_plotly.update_xaxes(showspikes=False)
-    else:
-        fig_plotly.update_layout(hovermode="x")
         fig_plotly.update_xaxes(showspikes=True, spikemode="across", spikesnap="cursor", showline=True)
-    st.plotly_chart(fig_plotly, use_container_width=True)
+        st.plotly_chart(fig_plotly, width="stretch")
+    else:
+        st.caption(f"⏵ 播放中（step {t} / {T - 1}）— 暂停后查看 state/action 图表")
 
-    # Play 期间的自增+rerun 放在 fragment 内部：st.rerun() 在 fragment 里默认只重跑
-    # fragment 本身，不会带动全页重新执行（下面的图表/表格不受影响）。
     if st.session_state.playing and T > 0:
         time.sleep(1.0 / st.session_state.fps)
         st.session_state.t += 1
         if st.session_state.t >= T:
             st.session_state.t = T - 1
             st.session_state.playing = False
-        st.rerun()
+        st.rerun(scope="fragment")
 
 
 _playback_fragment()
@@ -949,7 +942,7 @@ joint_health_rows = [r for r in health_rows if not r["topic"].startswith("camera
 st.markdown("#### Image Health")
 st.dataframe(
     image_health_rows,
-    use_container_width=True,
+    width="stretch",
     hide_index=True,
     height=min(1200, 38 + 35 * max(len(image_health_rows), 1)),
 )
@@ -965,7 +958,7 @@ if image_gap_rows:
     st.markdown("#### Image Gap 明细（按丢帧数从大到小；把 Playback 的 Step 拖到这个区间可核实）")
     st.dataframe(
         image_gap_rows,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         height=min(600, 38 + 35 * max(len(image_gap_rows), 1)),
     )
@@ -976,7 +969,7 @@ if image_gap_rows:
 st.markdown("## Joint Health")
 st.dataframe(
     joint_health_rows,
-    use_container_width=True,
+    width="stretch",
     hide_index=True,
     height=min(1200, 38 + 35 * max(len(joint_health_rows), 1)),
 )
@@ -1003,7 +996,7 @@ if joint_gap_rows:
     st.markdown("#### Joint Gap 明细（按丢帧数从大到小；把 Playback 的 Step 拖到这个区间可核实）")
     st.dataframe(
         joint_gap_rows,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         height=min(600, 38 + 35 * max(len(joint_gap_rows), 1)),
     )
