@@ -3,8 +3,10 @@ import argparse
 import json
 import os
 import glob
+import re
 import sys
 import time
+from functools import lru_cache
 from pathlib import Path
 
 import cv2
@@ -20,10 +22,9 @@ st.set_page_config(page_title="VLA Episode Viewer (LeRobot)", layout="wide")
 # =========================================================
 IMAGE_RESIZE_SIZE = (224, 224)
 NOMINAL_HZ_CAMERA = 30
-NOMINAL_HZ_STATE = 100
 GAP_TOLERANCE_MULTIPLIER = 1.5
 MAX_RENDERED_GAPS = 80
-DEFAULT_CAMERA_KEYS = ("head", "left_wrist", "right_wrist")
+lrv_cache_version = 2  # bump to invalidate cache
 
 
 def _parse_args():
@@ -39,45 +40,6 @@ DEFAULT_ROOT = _parse_args().data_path
 # Shared utility functions (mirrored from mcap_vis.py)
 # =========================================================
 
-def _median_period_ns(times):
-    if len(times) < 2:
-        return None
-    diffs = np.diff(np.array(times, dtype=np.int64))
-    diffs = diffs[diffs > 0]
-    return float(np.median(diffs)) if len(diffs) > 0 else None
-
-
-def _alignment_tolerance_ns(source_times, target_times):
-    periods = [p for p in (_median_period_ns(source_times), _median_period_ns(target_times)) if p]
-    if not periods:
-        return 50_000_000
-    return int(max(periods) * GAP_TOLERANCE_MULTIPLIER)
-
-
-def _nearest_alignment(source_times, target_times, tolerance_ns):
-    target_times = np.array(target_times, dtype=np.int64)
-    if len(source_times) == 0:
-        n = len(target_times)
-        return (np.full(n, -1, dtype=int), np.full(n, np.nan),
-                np.zeros(n, dtype=bool), np.full(n, -1, dtype=int), np.full(n, np.nan))
-    source_times = np.array(source_times, dtype=np.int64)
-    right = np.searchsorted(source_times, target_times)
-    left = np.clip(right - 1, 0, len(source_times) - 1)
-    right = np.clip(right, 0, len(source_times) - 1)
-    left_delta = np.abs(target_times - source_times[left])
-    right_delta = np.abs(source_times[right] - target_times)
-    use_right = right_delta < left_delta
-    raw_idx = np.where(use_right, right, left).astype(int)
-    signed_delta = source_times[raw_idx] - target_times
-    valid = np.abs(signed_delta) <= tolerance_ns
-    raw_delta_ms = signed_delta.astype(float) / 1e6
-    idx = raw_idx.copy()
-    idx[~valid] = -1
-    delta_ms = raw_delta_ms.copy()
-    delta_ms[~valid] = np.nan
-    return idx, delta_ms, valid, raw_idx, raw_delta_ms
-
-
 def _missing_runs(missing_mask):
     mask = np.asarray(missing_mask, dtype=bool)
     if mask.size == 0:
@@ -89,55 +51,27 @@ def _missing_runs(missing_mask):
     return [{"x0": int(s), "x1": int(e), "drop_frames": int(e - s + 1)} for s, e in zip(starts, ends)]
 
 
-def _build_reference_timeline(head_times, other_topics_times, tolerance_ns, nominal_period_ns):
-    head_arr = np.array(head_times, dtype=np.int64)
-    virtual = []
-    bounds = [t for times in other_topics_times if len(times) > 0 for t in (times[0], times[-1])]
-    if bounds:
-        t_min, t_max = min(bounds), max(bounds)
-        if head_arr[0] - t_min > tolerance_ns:
-            n = int((head_arr[0] - t_min) // nominal_period_ns)
-            virtual.extend(int(head_arr[0] - k * nominal_period_ns) for k in range(1, n + 1))
-        if t_max - head_arr[-1] > tolerance_ns:
-            n = int((t_max - head_arr[-1]) // nominal_period_ns)
-            virtual.extend(int(head_arr[-1] + k * nominal_period_ns) for k in range(1, n + 1))
-    for t0, t1 in zip(head_arr[:-1], head_arr[1:]):
-        diff = int(t1 - t0)
-        if diff <= tolerance_ns:
-            continue
-        n_missing = max(int(round(diff / nominal_period_ns)) - 1, 0)
-        if n_missing == 0:
-            continue
-        step = diff / (n_missing + 1)
-        virtual.extend(int(round(t0 + k * step)) for k in range(1, n_missing + 1))
-    virtual_arr = np.array(sorted(set(virtual)), dtype=np.int64) if virtual else np.zeros(0, dtype=np.int64)
-    combined = np.concatenate([head_arr, virtual_arr])
-    is_real = np.concatenate([np.ones(len(head_arr), dtype=bool), np.zeros(len(virtual_arr), dtype=bool)])
-    order = np.argsort(combined, kind="stable")
-    return combined[order], is_real[order]
-
-
-def _topic_stats(times):
-    if len(times) == 0:
+def _topic_stats(times_ns):
+    if len(times_ns) == 0:
         return {"count": 0, "hz": 0.0, "median_ms": np.nan, "max_gap_ms": np.nan}
-    if len(times) == 1:
+    if len(times_ns) == 1:
         return {"count": 1, "hz": 0.0, "median_ms": np.nan, "max_gap_ms": np.nan}
-    arr = np.array(times, dtype=np.int64)
+    arr = np.array(times_ns, dtype=np.int64)
     diffs = np.diff(arr)
     diffs = diffs[diffs > 0]
     if len(diffs) == 0:
-        return {"count": len(times), "hz": 0.0, "median_ms": np.nan, "max_gap_ms": np.nan}
+        return {"count": len(times_ns), "hz": 0.0, "median_ms": np.nan, "max_gap_ms": np.nan}
     duration_s = max((arr[-1] - arr[0]) / 1e9, 1e-9)
     return {
-        "count": len(times),
-        "hz": (len(times) - 1) / duration_s,
+        "count": len(times_ns),
+        "hz": (len(times_ns) - 1) / duration_s,
         "median_ms": float(np.median(diffs)) / 1e6,
         "max_gap_ms": float(np.max(diffs)) / 1e6,
     }
 
 
-def _health_row(times, spans, nominal_hz):
-    base = _topic_stats(times)
+def _health_row(times_ns, spans, nominal_hz):
+    base = _topic_stats(times_ns)
     base["drop_gaps"] = len(spans)
     base["drop_frames"] = int(sum(s["drop_frames"] for s in spans))
     base["coverage"] = (base["hz"] / nominal_hz) if nominal_hz else float("nan")
@@ -171,17 +105,6 @@ def labels_with_data(state, state_names, action, action_names):
 # LeRobot data helpers
 # =========================================================
 
-def list_episodes(root_dir):
-    pattern = os.path.join(root_dir, "data", "**", "*.parquet")
-    paths = sorted(glob.glob(pattern, recursive=True))
-    episodes, ep2path = [], {}
-    for p in paths:
-        ep_id = Path(p).stem  # e.g. episode_000000
-        episodes.append(ep_id)
-        ep2path[ep_id] = p
-    return episodes, ep2path
-
-
 def load_meta(root_dir):
     info_path = os.path.join(root_dir, "meta", "info.json")
     if not os.path.exists(info_path):
@@ -190,161 +113,163 @@ def load_meta(root_dir):
         return json.load(f)
 
 
-def _load_image(path):
-    if not os.path.exists(path):
-        return None
-    img = cv2.imread(path)
-    if img is None:
-        return None
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    return cv2.resize(img, IMAGE_RESIZE_SIZE, interpolation=cv2.INTER_AREA)
+def _camera_keys_from_meta(meta):
+    """Short camera keys (strip 'observation.images.' prefix) from info.json features."""
+    features = meta.get("features", {})
+    keys = []
+    for feat_key, feat_val in features.items():
+        if feat_key.startswith("observation.images.") and feat_val.get("dtype") == "video":
+            keys.append(feat_key[len("observation.images."):])
+    return tuple(keys) if keys else ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
 
 
-def _ts_to_ns(col_values):
-    """parquet timestamp 列（float64 秒）→ int64 纳秒。"""
-    return (np.array(col_values, dtype=np.float64) * 1e9).astype(np.int64)
+def _parse_chunk_file_indices(parquet_path):
+    p = Path(parquet_path)
+    file_idx = int(re.search(r"file-(\d+)", p.stem).group(1))
+    chunk_idx = int(re.search(r"chunk-(\d+)", p.parent.name).group(1))
+    return chunk_idx, file_idx
+
+
+def list_episodes(root_dir):
+    """Return (display_ids, ep2info) where ep2info maps display_id -> {path, episode_idx, chunk_idx, file_idx}."""
+    pattern = os.path.join(root_dir, "data", "**", "*.parquet")
+    paths = sorted(glob.glob(pattern, recursive=True))
+    display_ids = []
+    ep2info = {}
+    for p in paths:
+        try:
+            chunk_idx, file_idx = _parse_chunk_file_indices(p)
+        except Exception:
+            continue
+        df = pd.read_parquet(p, columns=["episode_index"])
+        for ep_idx in sorted(df["episode_index"].unique()):
+            ep_idx = int(ep_idx)
+            disp = f"episode_{ep_idx:06d}"
+            display_ids.append(disp)
+            ep2info[disp] = {"path": p, "episode_idx": ep_idx,
+                             "chunk_idx": chunk_idx, "file_idx": file_idx}
+    return display_ids, ep2info
+
+
+@lru_cache(maxsize=1000)
+def _get_frame(video_path: str, frame_idx: int):
+    """Read a single frame from MP4. Returns rgb uint8 array or None."""
+    if not os.path.exists(video_path):
+        return None
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+    ok, frame = cap.read()
+    cap.release()
+    if not ok:
+        return None
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    return cv2.resize(frame, IMAGE_RESIZE_SIZE, interpolation=cv2.INTER_AREA)
 
 
 @st.cache_data(max_entries=2, show_spinner="Loading LeRobot episode...")
-def load_episode(parquet_path: str, root_dir: str, camera_keys: tuple):
-    lrv_cache_version = 1  # noqa: F841 — bump to invalidate cache
-    df = pd.read_parquet(parquet_path)
-    episode_id = Path(parquet_path).stem
+def load_episode(parquet_path: str, episode_idx: int, root_dir: str,
+                 chunk_idx: int, file_idx: int, camera_keys: tuple):
+    _ = lrv_cache_version  # noqa: F841 — bump to invalidate cache
+
+    df_full = pd.read_parquet(parquet_path)
+    df = df_full[df_full["episode_index"] == episode_idx].reset_index(drop=True)
 
     meta = load_meta(root_dir)
     features = meta.get("features", {})
-    nominal_fps = meta.get("fps", NOMINAL_HZ_CAMERA)
+    nominal_fps = float(meta.get("fps", NOMINAL_HZ_CAMERA))
     nominal_period_ns = round(1e9 / nominal_fps)
 
-    T_raw = len(df)
-    frame_indices = df["frame_index"].values if "frame_index" in df.columns else np.arange(T_raw)
+    master_times_ns = (df["timestamp"].values.astype(np.float64) * 1e9).astype(np.int64)
+    frame_indices = df["frame_index"].values.astype(np.int64)
+    T = len(df)
 
-    # ---- 各字段时间戳（秒 → ns）----
-    def get_ts(feature_key):
-        col = f"{feature_key}.timestamp"
-        return _ts_to_ns(df[col].values) if col in df.columns else None
+    # ---- timestamp gap mask ----
+    gap_tol_ns = round(nominal_period_ns * GAP_TOLERANCE_MULTIPLIER)
+    if T > 1:
+        ts_gap_mask = np.concatenate([[False], np.diff(master_times_ns) > gap_tol_ns])
+    else:
+        ts_gap_mask = np.zeros(T, dtype=bool)
 
-    head_key = camera_keys[0]
-    head_ts = get_ts(f"observation.images.{head_key}")
-    if head_ts is None:
-        head_ts = np.arange(T_raw, dtype=np.int64) * nominal_period_ns
-
-    other_ts_list = []
-    for ck in camera_keys[1:]:
-        ts = get_ts(f"observation.images.{ck}")
-        if ts is not None:
-            other_ts_list.append(ts)
-    state_ts = get_ts("observation.state")
-    action_ts = get_ts("action")
-    if state_ts is not None:
-        other_ts_list.append(state_ts)
-    if action_ts is not None:
-        other_ts_list.append(action_ts)
-
-    # ---- Master 时间线（以 head 相机为基准）----
-    head_self_tol = _alignment_tolerance_ns(head_ts, head_ts)
-    master_times, head_is_real = _build_reference_timeline(
-        head_ts, other_ts_list, head_self_tol, nominal_period_ns
+    # ---- cameras ----
+    video_path_tpl = meta.get(
+        "video_path",
+        "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
     )
-    T = len(master_times)
-
-    # ---- 相机图片 ----
-    cameras = {}
-    camera_valid = {}
-    camera_counts = {}
+    camera_video_paths = {}
     camera_gap_spans = {}
     camera_stats = {}
+    master_missing = ts_gap_mask.copy()
 
     for cam_key in camera_keys:
-        cam_ts = get_ts(f"observation.images.{cam_key}")
-        if cam_ts is None:
-            cameras[cam_key] = [None] * T
-            camera_valid[cam_key] = [False] * T
-            camera_counts[cam_key] = 0
-            camera_gap_spans[cam_key] = []
-            camera_stats[f"camera:{cam_key}"] = _health_row([], [], nominal_fps)
-            continue
+        video_key = f"observation.images.{cam_key}"
+        video_path = os.path.join(
+            root_dir,
+            video_path_tpl.format(video_key=video_key,
+                                  chunk_index=chunk_idx, file_index=file_idx)
+        )
+        camera_video_paths[cam_key] = video_path
+        if not os.path.exists(video_path):
+            cam_missing = np.ones(T, dtype=bool)
+        else:
+            cap = cv2.VideoCapture(video_path)
+            total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
+            cam_missing = frame_indices >= total_video_frames
+        master_missing |= cam_missing
+        cam_spans = _missing_runs(cam_missing)
+        camera_gap_spans[cam_key] = cam_spans
+        camera_stats[f"camera:{cam_key}"] = _health_row(
+            master_times_ns.tolist(), cam_spans, nominal_fps
+        )
 
-        tol = _alignment_tolerance_ns(cam_ts, master_times)
-        idx, _, valid, raw_idx, _ = _nearest_alignment(cam_ts, master_times, tol)
-        if cam_key == head_key:
-            valid = head_is_real
-            idx = np.where(valid, raw_idx, -1)
+    gap_spans = _missing_runs(master_missing)
 
-        frames = []
-        for is_valid, raw_i in zip(valid, idx):
-            if is_valid and 0 <= raw_i < T_raw:
-                fidx = int(frame_indices[raw_i])
-                img_path = os.path.join(
-                    root_dir, "images", cam_key, episode_id, f"frame_{fidx:06d}.jpg"
-                )
-                frames.append(_load_image(img_path))
-            else:
-                frames.append(None)
-
-        valid_mask = np.array(valid, dtype=bool)
-        spans = _missing_runs(~valid_mask)
-        cameras[cam_key] = frames
-        camera_valid[cam_key] = valid_mask.tolist()
-        camera_counts[cam_key] = T_raw
-        camera_gap_spans[cam_key] = spans
-        camera_stats[f"camera:{cam_key}"] = _health_row(cam_ts.tolist(), spans, nominal_fps)
-
-    # ---- State / Action ----
+    # ---- state / action: NaN at gap positions ----
     signal_stats = {}
-    signal_gap_spans = {}
-
-    def _align_signal(ts, raw_arr, feature_key, nominal_hz):
-        tol = _alignment_tolerance_ns(ts, master_times)
-        s_idx, _, valid, _, _ = _nearest_alignment(ts, master_times, tol)
-        aligned = np.zeros((T, raw_arr.shape[1]))
-        vi = valid & (s_idx >= 0)
-        aligned[vi] = raw_arr[s_idx[vi]]
-        spans = _missing_runs(~valid)
-        signal_stats[feature_key] = _health_row(ts.tolist(), spans, nominal_hz)
-        return aligned, spans
-
     state_matrix = np.zeros((T, 0))
     state_names = []
-    if "observation.state" in df.columns and state_ts is not None:
-        raw_state = np.stack(df["observation.state"].values)
+    if "observation.state" in df.columns:
+        raw_state = np.stack(df["observation.state"].values).astype(np.float32)
+        raw_state[master_missing] = np.nan
         raw_names = features.get("observation.state", {}).get(
             "names", [f"[{i}]" for i in range(raw_state.shape[1])]
         )
-        aligned, spans = _align_signal(state_ts, raw_state, "observation.state", NOMINAL_HZ_STATE)
-        state_matrix = aligned
-        state_names = [f"observation.state.{n}" for n in raw_names]
-        if spans:
-            for n in state_names:
-                signal_gap_spans[n] = spans
+        state_matrix = raw_state
+        state_names = list(raw_names)
+        signal_stats["observation.state"] = _health_row(master_times_ns.tolist(), gap_spans, nominal_fps)
 
     action_matrix = np.zeros((T, 0))
     action_names = []
-    if "action" in df.columns and action_ts is not None:
-        raw_action = np.stack(df["action"].values)
+    if "action" in df.columns:
+        raw_action = np.stack(df["action"].values).astype(np.float32)
+        raw_action[master_missing] = np.nan
         raw_names = features.get("action", {}).get(
             "names", [f"[{i}]" for i in range(raw_action.shape[1])]
         )
-        aligned, spans = _align_signal(action_ts, raw_action, "action", NOMINAL_HZ_STATE)
-        action_matrix = aligned
-        action_names = [f"action.{n}" for n in raw_names]
-        if spans:
-            for n in action_names:
-                signal_gap_spans[n] = spans
+        action_matrix = raw_action
+        action_names = list(raw_names)
+        signal_stats["action"] = _health_row(master_times_ns.tolist(), gap_spans, nominal_fps)
+
+    intervention_mask = None
+    if "observation.intervention" in df.columns:
+        intervention_mask = df["observation.intervention"].values.astype(np.int64)
 
     return {
-        "cameras": cameras,
-        "camera_valid": camera_valid,
-        "camera_counts": camera_counts,
+        "camera_video_paths": camera_video_paths,
+        "frame_indices": frame_indices.tolist(),  # list[int], len=T
         "camera_gap_spans": camera_gap_spans,
-        "master_times": master_times,
+        "master_times": master_times_ns,
+        "gap_spans": gap_spans,
         "stats": {**camera_stats, **signal_stats},
-        "signal_gap_spans": signal_gap_spans,
         "state": state_matrix,
         "action": action_matrix,
         "state_names": state_names,
         "action_names": action_names,
+        "intervention_mask": intervention_mask,
         "total_step": T,
+        "nominal_fps": nominal_fps,
     }
 
 
@@ -353,18 +278,23 @@ def load_episode(parquet_path: str, root_dir: str, camera_keys: tuple):
 # =========================================================
 st.sidebar.title("Data Source (LeRobot)")
 root_dir = st.sidebar.text_input("dataset root dir", DEFAULT_ROOT)
-episodes, ep2path = list_episodes(root_dir)
-if not episodes:
+meta = load_meta(root_dir)
+camera_keys = _camera_keys_from_meta(meta)
+
+display_ids, ep2info = list_episodes(root_dir)
+if not display_ids:
     st.error(f"在 {root_dir}/data 下没有找到 *.parquet 文件")
     st.stop()
 
-episode_id = st.sidebar.selectbox("Select Episode", episodes)
-parquet_path = ep2path[episode_id]
-st.sidebar.caption(parquet_path)
+episode_disp = st.sidebar.selectbox("Select Episode", display_ids)
+info = ep2info[episode_disp]
+st.sidebar.caption(info["path"])
 
-camera_keys = DEFAULT_CAMERA_KEYS
 try:
-    data = load_episode(parquet_path, root_dir, camera_keys)
+    data = load_episode(
+        info["path"], info["episode_idx"], root_dir,
+        info["chunk_idx"], info["file_idx"], camera_keys
+    )
 except Exception as e:
     st.error(f"加载失败：{e}")
     st.stop()
@@ -374,23 +304,21 @@ action = data["action"]
 state_names = data["state_names"]
 action_names = data["action_names"]
 T = data["total_step"]
-cameras = data["cameras"]
-camera_counts = data["camera_counts"]
+camera_video_paths = data["camera_video_paths"]
+frame_indices = data["frame_indices"]
 camera_gap_spans = data["camera_gap_spans"]
 master_times = data["master_times"]
+gap_spans = data["gap_spans"]
 stats = data["stats"]
-signal_gap_spans = data["signal_gap_spans"]
-
-D_state = state.shape[1] if state.ndim == 2 else 0
-D_action = action.shape[1] if action.ndim == 2 else 0
+intervention_mask = data["intervention_mask"]
 
 # =========================================================
 # Episode change detection
 # =========================================================
 if "lr_episode_key" not in st.session_state:
-    st.session_state.lr_episode_key = episode_id
-if st.session_state.lr_episode_key != episode_id:
-    st.session_state.lr_episode_key = episode_id
+    st.session_state.lr_episode_key = episode_disp
+if st.session_state.lr_episode_key != episode_disp:
+    st.session_state.lr_episode_key = episode_disp
     st.session_state.t = 0
     st.session_state.playing = False
     st.rerun()
@@ -411,14 +339,17 @@ st.session_state.t = min(st.session_state.t, T - 1) if T > 0 else 0
 def _playback_fragment():
     st.markdown("## Img / State / Action")
     toggle_label = "⏸ Pause" if st.session_state.playing else "▶ Play"
-    if st.button(toggle_label, use_container_width=True):
+    if st.button(toggle_label, width="stretch"):
         st.session_state.playing = not st.session_state.playing
+        st.rerun(scope="fragment")
     st.session_state.fps = st.slider("FPS", 5, 60, st.session_state.fps)
     t_manual = st.slider("Step", 0, max(T - 1, 0), st.session_state.t)
     if t_manual != st.session_state.t:
         st.session_state.t = t_manual
         st.session_state.playing = False
     t = st.session_state.t
+    D_state = state.shape[1] if state.ndim == 2 else 0
+    D_action = action.shape[1] if action.ndim == 2 else 0
 
     # ---- Dim selection ----
     all_labels = [f"S:{n}" for n in state_names] + [f"A:{n}" for n in action_names]
@@ -444,42 +375,22 @@ def _playback_fragment():
     cols = st.columns(len(camera_keys))
     for col, cam_key in zip(cols, camera_keys):
         with col:
-            frames = cameras.get(cam_key, [])
-            img = frames[t] if frames and t < len(frames) else None
-            total = camera_counts.get(cam_key, 0)
+            video_path = camera_video_paths.get(cam_key, "")
+            fi = frame_indices[t] if t < len(frame_indices) else -1
+            img = _get_frame(video_path, fi) if fi >= 0 and video_path else None
             if img is not None:
                 st.image(img,
-                         caption=f"{cam_key}  step {t + 1}/{total}  ({IMAGE_RESIZE_SIZE[0]}×{IMAGE_RESIZE_SIZE[1]})",
+                         caption=f"{cam_key}  step {t + 1}/{T}  ({IMAGE_RESIZE_SIZE[0]}×{IMAGE_RESIZE_SIZE[1]})",
                          output_format="JPEG")
             else:
                 st.warning(f"{cam_key} missing at step {t}")
 
+    # ---- Intervention overlay ----
+    if intervention_mask is not None and intervention_mask[t]:
+        st.info(f"Step {t}: intervention=1")
+
     # ---- Signal plot ----
-    topics_in_view = []
-    if any(l.startswith("S:") for l in selected_dims):
-        topics_in_view.append("observation.state")
-    if any(l.startswith("A:") for l in selected_dims):
-        topics_in_view.append("action")
-
     _GAP_COLORS = ["rgb(220,38,38)", "rgb(37,99,235)", "rgb(217,119,6)", "rgb(5,150,105)"]
-    n_lanes = max(len(topics_in_view), 1)
-    lane_h = (0.95 - 0.05) / n_lanes
-    topic_style = {
-        tpc: {"y0": 0.05 + i * lane_h, "y1": 0.05 + (i + 1) * lane_h,
-              "color": _GAP_COLORS[i % len(_GAP_COLORS)]}
-        for i, tpc in enumerate(topics_in_view)
-    }
-
-    gap_spans_by_topic = {}
-    for label in selected_dims:
-        series_name = label[2:]
-        tpc = "observation.state" if label.startswith("S:") else "action"
-        seen = {(s["x0"], s["x1"]) for s in gap_spans_by_topic.get(tpc, [])}
-        for span in signal_gap_spans.get(series_name, [])[:MAX_RENDERED_GAPS]:
-            key = (span["x0"], span["x1"])
-            if key not in seen:
-                seen.add(key)
-                gap_spans_by_topic.setdefault(tpc, []).append(span)
 
     fig = go.Figure()
     plot_x = np.arange(T)
@@ -491,11 +402,18 @@ def _playback_fragment():
         label = f"A:{action_names[i]}"
         if label in selected_dims:
             fig.add_trace(go.Scatter(x=plot_x, y=action[:, i], name=label, line=dict(dash="dot")))
-    for tpc, spans in gap_spans_by_topic.items():
-        style = topic_style[tpc]
-        _add_gap_lines(fig, spans[:MAX_RENDERED_GAPS],
-                       y0=style["y0"], y1=style["y1"], color=style["color"],
-                       label_prefix=f"{tpc} ")
+
+    if gap_spans and selected_dims:
+        _add_gap_lines(fig, gap_spans[:MAX_RENDERED_GAPS],
+                       y0=0.05, y1=0.95, color=_GAP_COLORS[0], label_prefix="gap ")
+
+    # Intervention shading
+    if intervention_mask is not None and np.any(intervention_mask):
+        iv_spans = _missing_runs(intervention_mask.astype(bool))
+        for span in iv_spans:
+            fig.add_vrect(x0=span["x0"], x1=span["x1"],
+                          fillcolor="rgba(99,102,241,0.15)", line_width=0)
+
     fig.update_layout(height=350, dragmode="select", xaxis_title="Step")
     if st.session_state.playing:
         fig.add_vline(x=t, line_color="red", line_width=2)
@@ -504,7 +422,7 @@ def _playback_fragment():
     else:
         fig.update_layout(hovermode="x")
         fig.update_xaxes(showspikes=True, spikemode="across", spikesnap="cursor", showline=True)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     if st.session_state.playing and T > 0:
         time.sleep(1.0 / st.session_state.fps)
@@ -512,7 +430,7 @@ def _playback_fragment():
         if st.session_state.t >= T:
             st.session_state.t = T - 1
             st.session_state.playing = False
-        st.rerun()
+        st.rerun(scope="fragment")
 
 
 _playback_fragment()
@@ -539,7 +457,7 @@ image_health = [r for r in health_rows if r["topic"].startswith("camera:")]
 signal_health = [r for r in health_rows if not r["topic"].startswith("camera:")]
 
 st.markdown("#### Image Health")
-st.dataframe(image_health, use_container_width=True, hide_index=True,
+st.dataframe(image_health, width="stretch", hide_index=True,
              height=min(1200, 38 + 35 * max(len(image_health), 1)))
 
 image_gap_rows = [
@@ -549,28 +467,18 @@ image_gap_rows = [
 ]
 if image_gap_rows:
     st.markdown("#### Image Gap 明细")
-    st.dataframe(image_gap_rows, use_container_width=True, hide_index=True,
+    st.dataframe(image_gap_rows, width="stretch", hide_index=True,
                  height=min(600, 38 + 35 * max(len(image_gap_rows), 1)))
 
 st.markdown("## Signal Health")
-st.dataframe(signal_health, use_container_width=True, hide_index=True,
+st.dataframe(signal_health, width="stretch", hide_index=True,
              height=min(1200, 38 + 35 * max(len(signal_health), 1)))
 
-joint_gap_by_topic = {}
-for field_key, spans in signal_gap_spans.items():
-    topic = ".".join(field_key.split(".")[:2])  # observation.state or action
-    seen = {(s["x0"], s["x1"]) for s in joint_gap_by_topic.get(topic, [])}
-    for span in spans:
-        key = (span["x0"], span["x1"])
-        if key not in seen:
-            seen.add(key)
-            joint_gap_by_topic.setdefault(topic, []).append(span)
-joint_gap_rows = [
-    {"topic": topic, "step_range": f"{s['x0']}-{s['x1']}", "drop_frames": s["drop_frames"]}
-    for topic in joint_gap_by_topic
-    for s in sorted(joint_gap_by_topic[topic], key=lambda x: -x["drop_frames"])
-]
-if joint_gap_rows:
+if gap_spans:
+    gap_rows = [
+        {"step_range": f"{s['x0']}-{s['x1']}", "drop_frames": s["drop_frames"]}
+        for s in sorted(gap_spans, key=lambda x: -x["drop_frames"])
+    ]
     st.markdown("#### Signal Gap 明细")
-    st.dataframe(joint_gap_rows, use_container_width=True, hide_index=True,
-                 height=min(600, 38 + 35 * max(len(joint_gap_rows), 1)))
+    st.dataframe(gap_rows, width="stretch", hide_index=True,
+                 height=min(600, 38 + 35 * max(len(gap_rows), 1)))
