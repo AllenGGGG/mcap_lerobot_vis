@@ -10,8 +10,6 @@ from pathlib import Path
 import numpy as np
 import cv2
 import streamlit as st
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_agg import FigureCanvasAgg
 import plotly.graph_objects as go
 from mcap.reader import make_reader, NonSeekingReader
 from mcap.exceptions import McapError, EndOfFile
@@ -60,6 +58,7 @@ SESSION_GAP_NS = 300_000_000  # 300 ms
 GAP_TOLERANCE_MULTIPLIER = 1.5
 # Plotly 图上最多渲染多少段丢帧竖线，避免极端情况下卡顿
 MAX_RENDERED_GAPS = 80
+PLAYBACK_PLOT_HALF_WINDOW = 120
 
 
 # =========================================================
@@ -723,7 +722,6 @@ def _playback_fragment():
     toggle_label = "⏸ Pause" if st.session_state.playing else "▶ Play"
     if st.button(toggle_label, width="stretch"):
         st.session_state.playing = not st.session_state.playing
-        st.rerun(scope="fragment")
     st.session_state.fps = st.slider("FPS", 5, 60, st.session_state.fps)
     t_manual = st.slider("Step", 0, max(T - 1, 0), st.session_state.t)
     if t_manual != st.session_state.t:
@@ -787,7 +785,6 @@ def _playback_fragment():
         "Select state / action dims",
         labels,
         key=multiselect_key,
-        disabled=st.session_state.playing,
     )
     st.session_state.selected_dims = selected_dims
 
@@ -902,9 +899,44 @@ def _playback_fragment():
             hovermode="x",
         )
         fig_plotly.update_xaxes(showspikes=True, spikemode="across", spikesnap="cursor", showline=True)
-        st.plotly_chart(fig_plotly, width="stretch")
+        st.plotly_chart(
+            fig_plotly,
+            width="stretch",
+            key=f"mcap_signal_plot_{st.session_state.current_episode_key}",
+        )
     else:
-        st.caption(f"⏵ 播放中（step {t} / {T - 1}）— 暂停后查看 state/action 图表")
+        x0 = max(0, t - PLAYBACK_PLOT_HALF_WINDOW)
+        x1 = min(T, t + PLAYBACK_PLOT_HALF_WINDOW + 1)
+        plot_x = np.arange(x0, x1)
+        fig_plotly = go.Figure()
+        for i in range(D_state):
+            label = f"S:{state_names[i]}"
+            if label in selected_dims:
+                fig_plotly.add_trace(go.Scatter(
+                    x=plot_x, y=state[x0:x1, i], name=label,
+                    mode="lines", line=dict(width=1),
+                ))
+        for i in range(D_action):
+            label = f"A:{action_names[i]}"
+            if label in selected_dims:
+                fig_plotly.add_trace(go.Scatter(
+                    x=plot_x, y=action[x0:x1, i], name=label,
+                    mode="lines", line=dict(width=1, dash="dot"),
+                ))
+        fig_plotly.add_vline(x=t, line_color="red", line_width=2)
+        fig_plotly.update_layout(
+            height=350,
+            xaxis_title="Step",
+            hovermode=False,
+            showlegend=True,
+        )
+        fig_plotly.update_xaxes(range=[x0, max(x1 - 1, x0)], showspikes=False)
+        st.plotly_chart(
+            fig_plotly,
+            width="stretch",
+            key=f"mcap_signal_plot_{st.session_state.current_episode_key}",
+            config={"displayModeBar": False},
+        )
 
     if st.session_state.playing and T > 0:
         time.sleep(1.0 / st.session_state.fps)

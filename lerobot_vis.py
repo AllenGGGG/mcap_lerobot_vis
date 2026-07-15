@@ -24,7 +24,8 @@ IMAGE_RESIZE_SIZE = (224, 224)
 NOMINAL_HZ_CAMERA = 30
 GAP_TOLERANCE_MULTIPLIER = 1.5
 MAX_RENDERED_GAPS = 80
-lrv_cache_version = 2  # bump to invalidate cache
+PLAYBACK_PLOT_HALF_WINDOW = 120
+lrv_cache_version = 3  # bump to invalidate cache
 
 
 def _parse_args():
@@ -130,6 +131,20 @@ def _parse_chunk_file_indices(parquet_path):
     return chunk_idx, file_idx
 
 
+@lru_cache(maxsize=4)
+def _load_episodes_meta(root_dir):
+    """Load meta/episodes/**/*.parquet (LeRobot v3+): gives, per episode, which
+    chunk/file each camera's video segment lives in and its time offset within
+    that file. Needed because in v3 multiple episodes are packed into shared
+    video files, and each camera can be chunked into different files than the
+    data parquet and than each other. Returns None if absent (older format)."""
+    pattern = os.path.join(root_dir, "meta", "episodes", "**", "*.parquet")
+    paths = sorted(glob.glob(pattern, recursive=True))
+    if not paths:
+        return None
+    return pd.concat([pd.read_parquet(p) for p in paths], ignore_index=True)
+
+
 def list_episodes(root_dir):
     """Return (display_ids, ep2info) where ep2info maps display_id -> {path, episode_idx, chunk_idx, file_idx}."""
     pattern = os.path.join(root_dir, "data", "**", "*.parquet")
@@ -182,7 +197,7 @@ def load_episode(parquet_path: str, episode_idx: int, root_dir: str,
     nominal_period_ns = round(1e9 / nominal_fps)
 
     master_times_ns = (df["timestamp"].values.astype(np.float64) * 1e9).astype(np.int64)
-    frame_indices = df["frame_index"].values.astype(np.int64)
+    row_timestamps_s = df["timestamp"].values.astype(np.float64)
     T = len(df)
 
     # ---- timestamp gap mask ----
@@ -193,30 +208,56 @@ def load_episode(parquet_path: str, episode_idx: int, root_dir: str,
         ts_gap_mask = np.zeros(T, dtype=bool)
 
     # ---- cameras ----
+    # LeRobot v3+ packs many episodes into shared video files, and each camera can
+    # land in a different chunk/file than the data parquet and than other cameras.
+    # meta/episodes/**/*.parquet records, per episode per camera, the actual
+    # chunk/file and the from_timestamp offset of that camera's segment — use that
+    # instead of assuming every camera reuses the data file's chunk/file (which
+    # silently points at the wrong episode's frames once files no longer align 1:1).
+    episodes_meta = _load_episodes_meta(root_dir)
+    ep_row = None
+    if episodes_meta is not None:
+        match = episodes_meta[episodes_meta["episode_index"] == episode_idx]
+        if len(match) > 0:
+            ep_row = match.iloc[0]
+
     video_path_tpl = meta.get(
         "video_path",
         "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
     )
     camera_video_paths = {}
+    camera_frame_indices = {}
     camera_gap_spans = {}
     camera_stats = {}
     master_missing = ts_gap_mask.copy()
 
     for cam_key in camera_keys:
         video_key = f"observation.images.{cam_key}"
+        cam_chunk_idx, cam_file_idx, from_ts_s = chunk_idx, file_idx, 0.0
+        if ep_row is not None and f"videos/{video_key}/chunk_index" in ep_row.index:
+            cam_chunk_idx = int(ep_row[f"videos/{video_key}/chunk_index"])
+            cam_file_idx = int(ep_row[f"videos/{video_key}/file_index"])
+            from_ts_s = float(ep_row[f"videos/{video_key}/from_timestamp"])
         video_path = os.path.join(
             root_dir,
             video_path_tpl.format(video_key=video_key,
-                                  chunk_index=chunk_idx, file_index=file_idx)
+                                  chunk_index=cam_chunk_idx, file_index=cam_file_idx)
         )
         camera_video_paths[cam_key] = video_path
+        cam_fps = float(features.get(video_key, {}).get("info", {}).get("video.fps", nominal_fps))
+        # Video-local frame index: this row's episode-local timestamp (starts at 0)
+        # plus the segment's start offset within the shared video file — not the
+        # (episode-local) `frame_index` column, which resets to 0 per episode and
+        # is meaningless once episodes share a file.
+        frame_idx_for_cam = np.round((row_timestamps_s + from_ts_s) * cam_fps).astype(np.int64)
+        camera_frame_indices[cam_key] = frame_idx_for_cam.tolist()
         if not os.path.exists(video_path):
             cam_missing = np.ones(T, dtype=bool)
         else:
             cap = cv2.VideoCapture(video_path)
             total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             cap.release()
-            cam_missing = frame_indices >= total_video_frames
+            cam_missing = (frame_idx_for_cam < 0) | (frame_idx_for_cam >= total_video_frames)
         master_missing |= cam_missing
         cam_spans = _missing_runs(cam_missing)
         camera_gap_spans[cam_key] = cam_spans
@@ -258,7 +299,7 @@ def load_episode(parquet_path: str, episode_idx: int, root_dir: str,
 
     return {
         "camera_video_paths": camera_video_paths,
-        "frame_indices": frame_indices.tolist(),  # list[int], len=T
+        "camera_frame_indices": camera_frame_indices,  # cam_key -> list[int], len=T
         "camera_gap_spans": camera_gap_spans,
         "master_times": master_times_ns,
         "gap_spans": gap_spans,
@@ -305,7 +346,7 @@ state_names = data["state_names"]
 action_names = data["action_names"]
 T = data["total_step"]
 camera_video_paths = data["camera_video_paths"]
-frame_indices = data["frame_indices"]
+camera_frame_indices = data["camera_frame_indices"]
 camera_gap_spans = data["camera_gap_spans"]
 master_times = data["master_times"]
 gap_spans = data["gap_spans"]
@@ -341,7 +382,6 @@ def _playback_fragment():
     toggle_label = "⏸ Pause" if st.session_state.playing else "▶ Play"
     if st.button(toggle_label, width="stretch"):
         st.session_state.playing = not st.session_state.playing
-        st.rerun(scope="fragment")
     st.session_state.fps = st.slider("FPS", 5, 60, st.session_state.fps)
     t_manual = st.slider("Step", 0, max(T - 1, 0), st.session_state.t)
     if t_manual != st.session_state.t:
@@ -368,7 +408,6 @@ def _playback_fragment():
 
     selected_dims = st.multiselect(
         "Select state / action dims", all_labels, key=mk,
-        disabled=st.session_state.playing,
     )
 
     # ---- Camera grid ----
@@ -376,7 +415,8 @@ def _playback_fragment():
     for col, cam_key in zip(cols, camera_keys):
         with col:
             video_path = camera_video_paths.get(cam_key, "")
-            fi = frame_indices[t] if t < len(frame_indices) else -1
+            cam_fi = camera_frame_indices.get(cam_key, [])
+            fi = cam_fi[t] if t < len(cam_fi) else -1
             img = _get_frame(video_path, fi) if fi >= 0 and video_path else None
             if img is not None:
                 st.image(img,
@@ -392,37 +432,70 @@ def _playback_fragment():
     # ---- Signal plot ----
     _GAP_COLORS = ["rgb(220,38,38)", "rgb(37,99,235)", "rgb(217,119,6)", "rgb(5,150,105)"]
 
-    fig = go.Figure()
-    plot_x = np.arange(T)
-    for i in range(D_state):
-        label = f"S:{state_names[i]}"
-        if label in selected_dims:
-            fig.add_trace(go.Scatter(x=plot_x, y=state[:, i], name=label))
-    for i in range(D_action):
-        label = f"A:{action_names[i]}"
-        if label in selected_dims:
-            fig.add_trace(go.Scatter(x=plot_x, y=action[:, i], name=label, line=dict(dash="dot")))
+    if not st.session_state.playing:
+        fig = go.Figure()
+        plot_x = np.arange(T)
+        for i in range(D_state):
+            label = f"S:{state_names[i]}"
+            if label in selected_dims:
+                fig.add_trace(go.Scatter(x=plot_x, y=state[:, i], name=label))
+        for i in range(D_action):
+            label = f"A:{action_names[i]}"
+            if label in selected_dims:
+                fig.add_trace(go.Scatter(x=plot_x, y=action[:, i], name=label, line=dict(dash="dot")))
 
-    if gap_spans and selected_dims:
-        _add_gap_lines(fig, gap_spans[:MAX_RENDERED_GAPS],
-                       y0=0.05, y1=0.95, color=_GAP_COLORS[0], label_prefix="gap ")
+        if gap_spans and selected_dims:
+            _add_gap_lines(fig, gap_spans[:MAX_RENDERED_GAPS],
+                           y0=0.05, y1=0.95, color=_GAP_COLORS[0], label_prefix="gap ")
 
-    # Intervention shading
-    if intervention_mask is not None and np.any(intervention_mask):
-        iv_spans = _missing_runs(intervention_mask.astype(bool))
-        for span in iv_spans:
-            fig.add_vrect(x0=span["x0"], x1=span["x1"],
-                          fillcolor="rgba(99,102,241,0.15)", line_width=0)
+        # Intervention shading
+        if intervention_mask is not None and np.any(intervention_mask):
+            iv_spans = _missing_runs(intervention_mask.astype(bool))
+            for span in iv_spans:
+                fig.add_vrect(x0=span["x0"], x1=span["x1"],
+                              fillcolor="rgba(99,102,241,0.15)", line_width=0)
 
-    fig.update_layout(height=350, dragmode="select", xaxis_title="Step")
-    if st.session_state.playing:
         fig.add_vline(x=t, line_color="red", line_width=2)
-        fig.update_layout(hovermode=False)
-        fig.update_xaxes(showspikes=False)
-    else:
-        fig.update_layout(hovermode="x")
+        fig.update_layout(height=350, dragmode="select", xaxis_title="Step", hovermode="x")
         fig.update_xaxes(showspikes=True, spikemode="across", spikesnap="cursor", showline=True)
-    st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(
+            fig,
+            width="stretch",
+            key=f"lr_signal_plot_{st.session_state.lr_episode_key}",
+        )
+    else:
+        x0 = max(0, t - PLAYBACK_PLOT_HALF_WINDOW)
+        x1 = min(T, t + PLAYBACK_PLOT_HALF_WINDOW + 1)
+        plot_x = np.arange(x0, x1)
+        fig = go.Figure()
+        for i in range(D_state):
+            label = f"S:{state_names[i]}"
+            if label in selected_dims:
+                fig.add_trace(go.Scatter(
+                    x=plot_x, y=state[x0:x1, i], name=label,
+                    mode="lines", line=dict(width=1),
+                ))
+        for i in range(D_action):
+            label = f"A:{action_names[i]}"
+            if label in selected_dims:
+                fig.add_trace(go.Scatter(
+                    x=plot_x, y=action[x0:x1, i], name=label,
+                    mode="lines", line=dict(width=1, dash="dot"),
+                ))
+        fig.add_vline(x=t, line_color="red", line_width=2)
+        fig.update_layout(
+            height=350,
+            xaxis_title="Step",
+            hovermode=False,
+            showlegend=True,
+        )
+        fig.update_xaxes(range=[x0, max(x1 - 1, x0)], showspikes=False)
+        st.plotly_chart(
+            fig,
+            width="stretch",
+            key=f"lr_signal_plot_{st.session_state.lr_episode_key}",
+            config={"displayModeBar": False},
+        )
 
     if st.session_state.playing and T > 0:
         time.sleep(1.0 / st.session_state.fps)
