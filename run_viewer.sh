@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve the real script path so this launcher also works through a symlink
+# such as /home/fiveages/scripts/data_vis.sh.
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 ENV_NAME="${VIS_ENV_NAME:-lerobot_vis}"
 DEFAULT_MCAP_PATH="/home/fiveages/data/mcap_data"
 DEFAULT_LEROBOT_PATH="/home/fiveages/data/lerobot_data"
