@@ -5,7 +5,6 @@ import os
 import glob
 import re
 import sys
-import time
 from functools import lru_cache
 from pathlib import Path
 
@@ -14,6 +13,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
+from plotly.colors import qualitative
+from smooth_player import show_smooth_player
 
 st.set_page_config(page_title="VLA Episode Viewer (LeRobot)", layout="wide")
 
@@ -24,8 +25,7 @@ IMAGE_RESIZE_SIZE = (224, 224)
 NOMINAL_HZ_CAMERA = 30
 GAP_TOLERANCE_MULTIPLIER = 1.5
 MAX_RENDERED_GAPS = 80
-PLAYBACK_PLOT_HALF_WINDOW = 120
-lrv_cache_version = 3  # bump to invalidate cache
+lrv_cache_version = 5  # bump to invalidate cache
 
 
 def _parse_args():
@@ -102,6 +102,13 @@ def labels_with_data(state, state_names, action, action_names):
     return selected
 
 
+def _lighter_hex_color(color, amount=0.3):
+    """Keep a signal's hue while making its action line easier to distinguish."""
+    rgb = [int(color[i:i + 2], 16) for i in (1, 3, 5)]
+    lighter = [round(channel + (255 - channel) * amount) for channel in rgb]
+    return f"rgb({lighter[0]}, {lighter[1]}, {lighter[2]})"
+
+
 # =========================================================
 # LeRobot data helpers
 # =========================================================
@@ -126,8 +133,24 @@ def _camera_keys_from_meta(meta):
 
 def _parse_chunk_file_indices(parquet_path):
     p = Path(parquet_path)
-    file_idx = int(re.search(r"file-(\d+)", p.stem).group(1))
-    chunk_idx = int(re.search(r"chunk-(\d+)", p.parent.name).group(1))
+    chunk_match = re.search(r"chunk-(\d+)", p.parent.name)
+    if chunk_match is None:
+        raise ValueError(f"Cannot parse chunk index from {parquet_path}")
+
+    # LeRobot v3 packs multiple episodes into file-NNN.parquet, while v2.x
+    # stores one episode per episode_NNNNNN.parquet.  For v2, use the episode
+    # index as a harmless file-index fallback; its metadata video template uses
+    # episode_index instead of file_index.
+    file_match = re.search(r"file-(\d+)", p.stem)
+    episode_match = re.search(r"episode_(\d+)", p.stem)
+    if file_match is not None:
+        file_idx = int(file_match.group(1))
+    elif episode_match is not None:
+        file_idx = int(episode_match.group(1))
+    else:
+        raise ValueError(f"Cannot parse file or episode index from {parquet_path}")
+
+    chunk_idx = int(chunk_match.group(1))
     return chunk_idx, file_idx
 
 
@@ -166,21 +189,45 @@ def list_episodes(root_dir):
     return display_ids, ep2info
 
 
-@lru_cache(maxsize=1000)
 def _get_frame(video_path: str, frame_idx: int):
-    """Read a single frame from MP4. Returns rgb uint8 array or None."""
+    """Read a frame while keeping each camera decoder open for this session."""
     if not os.path.exists(video_path):
         return None
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        return None
-    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+    readers = st.session_state.setdefault("lr_video_readers", {})
+    reader = readers.get(video_path)
+    if reader is None:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            cap.release()
+            return None
+        reader = {"cap": cap, "next_frame": 0, "frame_idx": None, "frame": None}
+        readers[video_path] = reader
+    if reader["frame_idx"] == frame_idx:
+        return reader["frame"]
+
+    cap = reader["cap"]
+    next_frame = reader["next_frame"]
+    if next_frame < frame_idx <= next_frame + 10:
+        for _ in range(frame_idx - next_frame):
+            if not cap.grab():
+                return None
+    elif next_frame != frame_idx:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
     ok, frame = cap.read()
-    cap.release()
     if not ok:
         return None
     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    return cv2.resize(frame, IMAGE_RESIZE_SIZE, interpolation=cv2.INTER_AREA)
+    frame = cv2.resize(frame, IMAGE_RESIZE_SIZE, interpolation=cv2.INTER_AREA)
+    reader.update(next_frame=frame_idx + 1, frame_idx=frame_idx, frame=frame)
+    return frame
+
+
+def _keep_video_readers(video_paths):
+    """Close decoders from the previously selected episode or dataset."""
+    readers = st.session_state.get("lr_video_readers", {})
+    for path in list(readers):
+        if path not in video_paths:
+            readers.pop(path)["cap"].release()
 
 
 @st.cache_data(max_entries=2, show_spinner="Loading LeRobot episode...")
@@ -226,6 +273,7 @@ def load_episode(parquet_path: str, episode_idx: int, root_dir: str,
         "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
     )
     camera_video_paths = {}
+    camera_video_offsets = {}
     camera_frame_indices = {}
     camera_gap_spans = {}
     camera_stats = {}
@@ -241,9 +289,13 @@ def load_episode(parquet_path: str, episode_idx: int, root_dir: str,
         video_path = os.path.join(
             root_dir,
             video_path_tpl.format(video_key=video_key,
-                                  chunk_index=cam_chunk_idx, file_index=cam_file_idx)
+                                  chunk_index=cam_chunk_idx,
+                                  file_index=cam_file_idx,
+                                  episode_chunk=cam_chunk_idx,
+                                  episode_index=episode_idx)
         )
         camera_video_paths[cam_key] = video_path
+        camera_video_offsets[cam_key] = from_ts_s
         cam_fps = float(features.get(video_key, {}).get("info", {}).get("video.fps", nominal_fps))
         # Video-local frame index: this row's episode-local timestamp (starts at 0)
         # plus the segment's start offset within the shared video file — not the
@@ -299,7 +351,9 @@ def load_episode(parquet_path: str, episode_idx: int, root_dir: str,
 
     return {
         "camera_video_paths": camera_video_paths,
+        "camera_video_offsets": camera_video_offsets,
         "camera_frame_indices": camera_frame_indices,  # cam_key -> list[int], len=T
+        "timestamps": row_timestamps_s,
         "camera_gap_spans": camera_gap_spans,
         "master_times": master_times_ns,
         "gap_spans": gap_spans,
@@ -327,7 +381,43 @@ if not display_ids:
     st.error(f"在 {root_dir}/data 下没有找到 *.parquet 文件")
     st.stop()
 
-episode_disp = st.sidebar.selectbox("Select Episode", display_ids)
+episode_widget_key = "lr_episode_selector"
+if st.session_state.get(episode_widget_key) not in display_ids:
+    st.session_state[episode_widget_key] = display_ids[0]
+
+
+def _step_episode(delta):
+    current = st.session_state.get(episode_widget_key, display_ids[0])
+    current_idx = display_ids.index(current) if current in display_ids else 0
+    next_idx = min(max(current_idx + delta, 0), len(display_ids) - 1)
+    st.session_state[episode_widget_key] = display_ids[next_idx]
+    st.session_state.t = 0
+
+
+episode_disp = st.sidebar.selectbox(
+    "Select Episode", display_ids, key=episode_widget_key
+)
+episode_pos = display_ids.index(episode_disp)
+episode_nav_cols = st.sidebar.columns(2)
+episode_nav_cols[0].button(
+    "↑ Previous",
+    key="lr_previous_episode",
+    on_click=_step_episode,
+    args=(-1,),
+    disabled=episode_pos == 0,
+    width="stretch",
+    shortcut="Up",
+)
+episode_nav_cols[1].button(
+    "↓ Next",
+    key="lr_next_episode",
+    on_click=_step_episode,
+    args=(1,),
+    disabled=episode_pos == len(display_ids) - 1,
+    width="stretch",
+    shortcut="Down",
+)
+st.sidebar.caption("快捷键：↑/↓ 切换 episode")
 info = ep2info[episode_disp]
 st.sidebar.caption(info["path"])
 
@@ -361,56 +451,87 @@ if "lr_episode_key" not in st.session_state:
 if st.session_state.lr_episode_key != episode_disp:
     st.session_state.lr_episode_key = episode_disp
     st.session_state.t = 0
-    st.session_state.playing = False
     st.rerun()
 
 # =========================================================
-# Session state
+# Playback and signal selection
 # =========================================================
-for key, default in [("t", 0), ("playing", False), ("fps", 30)]:
-    if key not in st.session_state:
-        st.session_state[key] = default
+if "t" not in st.session_state:
+    st.session_state.t = 0
 st.session_state.t = min(st.session_state.t, T - 1) if T > 0 else 0
 
+st.markdown("## 流畅播放")
+all_labels = [f"S:{n}" for n in state_names] + [f"A:{n}" for n in action_names]
+paired_names = [name for name in state_names
+                if name in action_names and not name.startswith("pad_")]
+default_dims = [label for name in paired_names[:4]
+                for label in (f"S:{name}", f"A:{name}")]
+default_dims = default_dims or labels_with_data(state, state_names, action, action_names)[:8]
+mk = "lr_selected_dims"
+store_key = "lr_selected_dims_value"
+stored_dims = [
+    label for label in st.session_state.get(store_key, default_dims)
+    if label in all_labels
+] or default_dims
+if mk not in st.session_state:
+    st.session_state[mk] = stored_dims
+else:
+    valid_dims = [label for label in st.session_state[mk] if label in all_labels]
+    if valid_dims != st.session_state[mk]:
+        st.session_state[mk] = valid_dims or stored_dims
+selected_dims = st.multiselect("Select state / action dims", all_labels, key=mk)
+st.session_state[store_key] = list(selected_dims)
+st.caption("同名关节用同一色系：S 实线是 state，A 浅色点线是 action（command）。")
+
+signal_names = list(dict.fromkeys([*state_names, *action_names]))
+signal_colors = {
+    name: qualitative.Dark24[i % len(qualitative.Dark24)]
+    for i, name in enumerate(signal_names)
+}
+state_indices = {name: i for i, name in enumerate(state_names)}
+action_indices = {name: i for i, name in enumerate(action_names)}
+selected_set = set(selected_dims)
+player_traces = []
+for name in signal_names:
+    state_label, action_label = f"S:{name}", f"A:{name}"
+    if name in state_indices and state_label in selected_set:
+        player_traces.append({"name": state_label, "color": signal_colors[name],
+                              "dashed": False, "values": state[:, state_indices[name]]})
+    if name in action_indices and action_label in selected_set:
+        player_traces.append({"name": action_label,
+                              "color": _lighter_hex_color(signal_colors[name]),
+                              "dashed": True, "values": action[:, action_indices[name]]})
+
+show_smooth_player(camera_video_paths, data["camera_video_offsets"],
+                   data["timestamps"], player_traces, st.session_state.t)
+
 
 # =========================================================
-# Playback fragment
+# Manual frame inspection
 # =========================================================
 @st.fragment
-def _playback_fragment():
-    st.markdown("## Img / State / Action")
-    toggle_label = "⏸ Pause" if st.session_state.playing else "▶ Play"
-    if st.button(toggle_label, width="stretch"):
-        st.session_state.playing = not st.session_state.playing
-    st.session_state.fps = st.slider("FPS", 5, 60, st.session_state.fps)
+def _inspection_fragment():
+    st.markdown("### 逐帧查看")
+    _keep_video_readers(set(camera_video_paths.values()))
+
+    def _step_frame(delta):
+        st.session_state.t = min(max(st.session_state.t + delta, 0), max(T - 1, 0))
+
+    frame_cols = st.columns(2)
+    frame_cols[0].button(
+        "← Previous frame", key="lr_previous_frame", on_click=_step_frame,
+        args=(-1,), disabled=st.session_state.t <= 0, width="stretch", shortcut="Left",
+    )
+    frame_cols[1].button(
+        "Next frame →", key="lr_next_frame", on_click=_step_frame,
+        args=(1,), disabled=st.session_state.t >= T - 1, width="stretch", shortcut="Right",
+    )
+    st.caption("上方视频可连续播放；这里可以拖动 Step 或用 ←/→ 逐帧细看。")
     t_manual = st.slider("Step", 0, max(T - 1, 0), st.session_state.t)
     if t_manual != st.session_state.t:
         st.session_state.t = t_manual
-        st.session_state.playing = False
     t = st.session_state.t
-    D_state = state.shape[1] if state.ndim == 2 else 0
-    D_action = action.shape[1] if action.ndim == 2 else 0
 
-    # ---- Dim selection ----
-    all_labels = [f"S:{n}" for n in state_names] + [f"A:{n}" for n in action_names]
-    default_dims = labels_with_data(state, state_names, action, action_names)[:8] or all_labels[:8]
-
-    mk = f"lr_dims_{st.session_state.lr_episode_key}"
-    mk_init = f"{mk}_init"
-    labels_sig = tuple(sorted(all_labels))
-    if st.session_state.get("lr_labels_sig") != labels_sig:
-        st.session_state.lr_labels_sig = labels_sig
-        st.session_state[mk] = default_dims
-        st.session_state[mk_init] = True
-    elif mk not in st.session_state or not st.session_state.get(mk_init):
-        st.session_state[mk] = default_dims
-        st.session_state[mk_init] = True
-
-    selected_dims = st.multiselect(
-        "Select state / action dims", all_labels, key=mk,
-    )
-
-    # ---- Camera grid ----
     cols = st.columns(len(camera_keys))
     for col, cam_key in zip(cols, camera_keys):
         with col:
@@ -425,88 +546,39 @@ def _playback_fragment():
             else:
                 st.warning(f"{cam_key} missing at step {t}")
 
-    # ---- Intervention overlay ----
     if intervention_mask is not None and intervention_mask[t]:
         st.info(f"Step {t}: intervention=1")
 
-    # ---- Signal plot ----
-    _GAP_COLORS = ["rgb(220,38,38)", "rgb(37,99,235)", "rgb(217,119,6)", "rgb(5,150,105)"]
+    fig = go.Figure()
+    plot_x = np.arange(T)
+    for name in signal_names:
+        color = signal_colors[name]
+        state_label, action_label = f"S:{name}", f"A:{name}"
+        if name in state_indices and state_label in selected_set:
+            fig.add_trace(go.Scatter(
+                x=plot_x, y=state[:, state_indices[name]], name=state_label,
+                mode="lines", line=dict(color=color, width=2),
+            ))
+        if name in action_indices and action_label in selected_set:
+            fig.add_trace(go.Scatter(
+                x=plot_x, y=action[:, action_indices[name]], name=action_label,
+                mode="lines", line=dict(color=_lighter_hex_color(color), width=2, dash="dot"),
+            ))
 
-    if not st.session_state.playing:
-        fig = go.Figure()
-        plot_x = np.arange(T)
-        for i in range(D_state):
-            label = f"S:{state_names[i]}"
-            if label in selected_dims:
-                fig.add_trace(go.Scatter(x=plot_x, y=state[:, i], name=label))
-        for i in range(D_action):
-            label = f"A:{action_names[i]}"
-            if label in selected_dims:
-                fig.add_trace(go.Scatter(x=plot_x, y=action[:, i], name=label, line=dict(dash="dot")))
-
-        if gap_spans and selected_dims:
-            _add_gap_lines(fig, gap_spans[:MAX_RENDERED_GAPS],
-                           y0=0.05, y1=0.95, color=_GAP_COLORS[0], label_prefix="gap ")
-
-        # Intervention shading
-        if intervention_mask is not None and np.any(intervention_mask):
-            iv_spans = _missing_runs(intervention_mask.astype(bool))
-            for span in iv_spans:
-                fig.add_vrect(x0=span["x0"], x1=span["x1"],
-                              fillcolor="rgba(99,102,241,0.15)", line_width=0)
-
-        fig.add_vline(x=t, line_color="red", line_width=2)
-        fig.update_layout(height=350, dragmode="select", xaxis_title="Step", hovermode="x")
-        fig.update_xaxes(showspikes=True, spikemode="across", spikesnap="cursor", showline=True)
-        st.plotly_chart(
-            fig,
-            width="stretch",
-            key=f"lr_signal_plot_{st.session_state.lr_episode_key}",
-        )
-    else:
-        x0 = max(0, t - PLAYBACK_PLOT_HALF_WINDOW)
-        x1 = min(T, t + PLAYBACK_PLOT_HALF_WINDOW + 1)
-        plot_x = np.arange(x0, x1)
-        fig = go.Figure()
-        for i in range(D_state):
-            label = f"S:{state_names[i]}"
-            if label in selected_dims:
-                fig.add_trace(go.Scatter(
-                    x=plot_x, y=state[x0:x1, i], name=label,
-                    mode="lines", line=dict(width=1),
-                ))
-        for i in range(D_action):
-            label = f"A:{action_names[i]}"
-            if label in selected_dims:
-                fig.add_trace(go.Scatter(
-                    x=plot_x, y=action[x0:x1, i], name=label,
-                    mode="lines", line=dict(width=1, dash="dot"),
-                ))
-        fig.add_vline(x=t, line_color="red", line_width=2)
-        fig.update_layout(
-            height=350,
-            xaxis_title="Step",
-            hovermode=False,
-            showlegend=True,
-        )
-        fig.update_xaxes(range=[x0, max(x1 - 1, x0)], showspikes=False)
-        st.plotly_chart(
-            fig,
-            width="stretch",
-            key=f"lr_signal_plot_{st.session_state.lr_episode_key}",
-            config={"displayModeBar": False},
-        )
-
-    if st.session_state.playing and T > 0:
-        time.sleep(1.0 / st.session_state.fps)
-        st.session_state.t += 1
-        if st.session_state.t >= T:
-            st.session_state.t = T - 1
-            st.session_state.playing = False
-        st.rerun(scope="fragment")
+    if gap_spans and selected_dims:
+        _add_gap_lines(fig, gap_spans[:MAX_RENDERED_GAPS],
+                       y0=0.05, y1=0.95, color="rgb(220,38,38)", label_prefix="gap ")
+    if intervention_mask is not None and np.any(intervention_mask):
+        for span in _missing_runs(intervention_mask.astype(bool)):
+            fig.add_vrect(x0=span["x0"], x1=span["x1"],
+                          fillcolor="rgba(99,102,241,0.15)", line_width=0)
+    fig.add_vline(x=t, line_color="red", line_width=2)
+    fig.update_layout(height=350, dragmode="select", xaxis_title="Step", hovermode="x")
+    fig.update_xaxes(showspikes=True, spikemode="across", spikesnap="cursor", showline=True)
+    st.plotly_chart(fig, width="stretch", key=f"lr_signal_plot_{st.session_state.lr_episode_key}")
 
 
-_playback_fragment()
+_inspection_fragment()
 
 # =========================================================
 # Data Health

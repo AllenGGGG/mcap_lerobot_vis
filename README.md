@@ -129,7 +129,8 @@ streamlit run lerobot_vis.py --server.address 0.0.0.0 --server.port 8501 -- --da
 
 ### 页面说明
 
-- **Img / State / Action**：Play/Pause、FPS 与 Step 控制；按 frame index 同步回放 `meta/info.json` 中发现的所有相机视频，并显示选中的 state/action 维度曲线。
+- **流畅播放**：浏览器连续播放并同步各相机视频；默认 1× 原速，可暂停、拖动 Step 或切换 0.5×/2×，选中的 state/action 曲线会显示同步移动的红线。
+- **逐帧查看**：用 Step 滑条或左右方向键检查单帧画面及完整的 state/action 曲线。
 - **Intervention**：数据包含 `observation.intervention` 时，当前 step 会显示 intervention 状态，曲线图中相应区间会高亮。
 - **Image Health**：每个相机的视频帧可用性、频率、时间戳间隔、丢帧数及 coverage。
 - **Signal Health**：`observation.state` 与 `action` 的同类统计；时间戳大间隔或相机视频缺帧会在信号中标为缺失。
