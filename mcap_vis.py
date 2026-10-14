@@ -41,7 +41,7 @@ DEFAULT_CAMERA_TOPICS = {
     "head": "/camera_head/color/image_raw/compressed",
     "right_wrist": "/camera_right_wrist/color/image_raw/compressed",
 }
-DEFAULT_STATE_TOPICS = ["/left_current_pose", "/right_current_pose", "/body_current_pose"]
+DEFAULT_STATE_TOPICS = ["/left_current_pose", "/right_current_pose", "/body_current_pose", "/joint_states"]
 DEFAULT_ACTION_TOPICS = ["/left_current_target", "/right_current_target"]
 DEFAULT_HAND_TOPICS = ["/left_hand_controller/target_percent", "/right_hand_controller/target_percent"]
 # 相机画面统一 resize 到的尺寸 (width, height)，VLA 模型输入常用 224x224
@@ -93,43 +93,6 @@ def _iter_mcap_messages(path, topics=None, issues=None):
                 issues.append(f"{Path(path).name} 读取中断，仅展示已读数据：{type(exc).__name__}")
 
 
-@st.cache_data(max_entries=8, show_spinner="Scanning MCAP topics...")
-def discover_topics(file_signatures):
-    """Inventory all channels, using message scans only when no summary is available."""
-    rows = {}
-    issues = []
-
-    def add(schema, channel, count):
-        key = (channel.topic, schema.name if schema else "", channel.message_encoding,
-               schema.encoding if schema else "")
-        row = rows.setdefault(key, {"topic": key[0], "schema": key[1],
-                                    "encoding": key[2], "schema_encoding": key[3], "count": 0})
-        row["count"] += count
-
-    for path, _, _ in file_signatures:
-        with open(path, "rb") as stream:
-            try:
-                summary = make_reader(stream).get_summary()
-            except MCAP_READ_ERRORS:
-                summary = None
-            if summary is not None and summary.statistics is not None:
-                for channel in summary.channels.values():
-                    add(summary.schemas.get(channel.schema_id), channel,
-                        summary.statistics.channel_message_counts.get(channel.id, 0))
-                continue
-        for schema, channel, _ in _iter_mcap_messages(path, issues=issues):
-            add(schema, channel, 1)
-    return sorted(rows.values(), key=lambda row: (row["topic"], row["schema"])), issues
-
-
-def _is_image_schema(name):
-    return name.replace("/msg/", "/") in ("sensor_msgs/Image", "sensor_msgs/CompressedImage")
-
-
-def _supports_ros2(row):
-    return row["encoding"] == "cdr" and row["schema_encoding"] == "ros2msg"
-
-
 def _sequence_items(value):
     if isinstance(value, np.ndarray):
         return value.tolist()
@@ -162,7 +125,7 @@ def _flatten_joint_state(msg, prefix=""):
 
 def _flatten(msg, prefix=""):
     """递归展开一个 decode 后的 ros2 消息为 {字段路径: float} 的字典。
-    自动跳过字符串/字节等非数值字段（如 frame_id）。"""
+    跳过消息头、字符串及字节等非信号字段。"""
     out = {}
     if isinstance(msg, (bool, np.bool_)):
         return {prefix: float(msg)}
@@ -190,7 +153,7 @@ def _flatten(msg, prefix=""):
             if not k.startswith("_") and not callable(getattr(msg, k, None))
         }
     for k, v in attrs.items():
-        if k.startswith("_"):
+        if k.startswith("_") or k == "header":
             continue
         new_prefix = f"{prefix}.{k}" if prefix else k
         out.update(_flatten(v, new_prefix))
@@ -239,20 +202,35 @@ def labels_with_data(state, state_names, action, action_names):
 
 def _signal_identity(name):
     topic, separator, field = name.partition(".")
-    # Recorded pose/target pairs carry the same physical signal under different topics.
-    if topic.endswith("_current_target"):
-        topic = topic.removesuffix("_current_target") + "_current_pose"
+    # Explicit pairs from the controller's PoseStamped publishers; never infer
+    # pairs from a generic "target" substring or copy feedback into action.
+    topic = {"/left_current_target": "/left_current_pose",
+             "/right_current_target": "/right_current_pose"}.get(topic, topic)
     return topic + separator + field
 
 
 def default_selected_dims(state_names, action_names, limit=8):
-    states = {_signal_identity(name): f"S:{name}" for name in state_names if ".header." not in name}
-    actions = {_signal_identity(name): f"A:{name}" for name in action_names if ".header." not in name}
+    states = {_signal_identity(name): f"S:{name}" for name in state_names}
+    actions = {_signal_identity(name): f"A:{name}" for name in action_names}
     pairs = [name for name in states if name in actions]
-    pairs.sort(key=lambda name: (".position" not in name, name))
+    position_pairs = [name for name in pairs if name.endswith(
+        (".position.x", ".position.y", ".position.z"))]
+    if position_pairs:
+        # Keep left/right XYZ complete rather than selecting three left axes
+        # and a single right axis just to fill a four-pair limit.
+        return [label for name in position_pairs for label in (states[name], actions[name])]
     if pairs:
         return [label for name in pairs[:max(limit // 2, 1)] for label in (states[name], actions[name])]
     return list(states.values())[:max(limit // 2, 1)] + list(actions.values())[:max(limit // 2, 1)]
+
+
+def ordered_signal_labels(state_names, action_names):
+    """Place genuine counterparts next to each other in controls and legends."""
+    groups = {}
+    for prefix, names in (("S", state_names), ("A", action_names)):
+        for name in names:
+            groups.setdefault(_signal_identity(name), []).append(f"{prefix}:{name}")
+    return [label for labels in groups.values() for label in labels]
 
 
 def _lighter_hex_color(color, amount=0.3):
@@ -488,7 +466,7 @@ def load_episode(file_signatures, camera_topics: dict, state_topics: tuple, acti
     signal_series = {}
     wanted_topics = set(camera_topics.values()) | set(state_topics) | set(action_topics)
     read_issues = []
-    topic_results = {topic: {"decoded": 0, "failed": 0, "fields": set(), "error": ""}
+    topic_results = {topic: {"failed": 0, "error": ""}
                      for topic in wanted_topics}
     camera_names = {topic: name for name, topic in camera_topics.items()}
     for path, _, _ in file_signatures:
@@ -513,8 +491,6 @@ def load_episode(file_signatures, camera_topics: dict, state_topics: tuple, acti
                 else:
                     flat = _flatten(ros_msg)
                     signal_series.setdefault(topic, []).append((t_ns, flat))
-                    result["fields"].update(flat)
-                result["decoded"] += 1
             except Exception as exc:
                 # A bad/custom topic must not suppress all other recorded signals.
                 result["failed"] += 1
@@ -671,7 +647,6 @@ def load_episode(file_signatures, camera_topics: dict, state_topics: tuple, acti
     return {
         "read_issues": read_issues,
         "topic_results": topic_results,
-        "reference": camera_topics[reference_camera] if reference_camera else reference_signal,
         "cameras": aligned_cameras,
         "camera_indices": camera_indices,
         "camera_delta_ms": camera_delta_ms,
@@ -705,88 +680,32 @@ mcap_paths = ep2path[episode_id]
 file_signatures = tuple((path, os.stat(path).st_size, os.stat(path).st_mtime_ns) for path in mcap_paths)
 for path in mcap_paths:
     st.sidebar.caption(path)
-inventory, inventory_issues = discover_topics(file_signatures)
-available_topics = {row["topic"] for row in inventory}
 with st.sidebar.expander("Topic 配置", expanded=False):
-    auto_discover = st.checkbox("自动加载其他相机和信号", value=True,
-                               help="自动发现 ROS2 图像和信号；target/command/action/cmd 归入 action，其余归入 state。可关闭后手动配置。")
-    st.caption("下面可指定相机别名及 state/action 分类。手控 topic 使用按压片段插值。")
+    st.caption("S 为机器人实际反馈，A 为 VR 控制指令。这里只读取明确配置的 topic。")
     left_wrist_topic = st.text_input("left_wrist topic", DEFAULT_CAMERA_TOPICS["left_wrist"])
     head_topic = st.text_input("head topic", DEFAULT_CAMERA_TOPICS["head"])
     right_wrist_topic = st.text_input("right_wrist topic", DEFAULT_CAMERA_TOPICS["right_wrist"])
     state_topics_str = st.text_input("state topics (逗号分隔)", ",".join(DEFAULT_STATE_TOPICS))
     action_topics_str = st.text_input("action topics (逗号分隔)", ",".join(DEFAULT_ACTION_TOPICS))
     hand_topics_str = st.text_input("hand topics (逗号分隔)", ",".join(DEFAULT_HAND_TOPICS))
-camera_topics = {}
-for name, topic in (("left_wrist", left_wrist_topic), ("head", head_topic), ("right_wrist", right_wrist_topic)):
-    topic = topic.strip()
-    if topic and topic not in camera_topics.values() and (not auto_discover or topic in available_topics):
-        camera_topics[name] = topic
-state_topics = list(dict.fromkeys(t.strip() for t in state_topics_str.split(",") if t.strip()))
+camera_topics = {name: topic.strip() for name, topic in (
+    ("left_wrist", left_wrist_topic), ("head", head_topic), ("right_wrist", right_wrist_topic)
+) if topic.strip()}
+state_topics = tuple(dict.fromkeys(t.strip() for t in state_topics_str.split(",") if t.strip()))
 hand_topics = tuple(dict.fromkeys(t.strip() for t in hand_topics_str.split(",") if t.strip()))
-action_topics = list(dict.fromkeys([*(t.strip() for t in action_topics_str.split(",") if t.strip()), *hand_topics]))
-if auto_discover:
-    state_topics = [topic for topic in state_topics if topic in available_topics]
-    action_topics = [topic for topic in action_topics if topic in available_topics]
-    for row in inventory:
-        topic = row["topic"]
-        if not _supports_ros2(row):
-            continue
-        if _is_image_schema(row["schema"]):
-            if topic not in camera_topics.values():
-                name = topic
-                while name in camera_topics:
-                    name += " (camera)"
-                camera_topics[name] = topic
-        elif topic not in set(state_topics) | set(action_topics) | set(camera_topics.values()):
-            (action_topics if any(token in topic.lower() for token in ("target", "command", "action", "cmd"))
-             else state_topics).append(topic)
-state_topics = tuple(topic for topic in state_topics if topic not in set(action_topics) | set(camera_topics.values()))
-action_topics = tuple(topic for topic in action_topics if topic not in camera_topics.values())
-data = load_episode(file_signatures, camera_topics, state_topics, action_topics, hand_topics)
-
-# Always show coverage, including unsupported/unselected topics and empty recordings.
-st.markdown("## 采集内容覆盖")
-results = data["topic_results"]
-coverage_rows = []
-for topic in sorted(available_topics):
-    topic_inventory = [row for row in inventory if row["topic"] == topic]
-    result = results.get(topic)
-    role = "camera" if topic in camera_topics.values() else "action" if topic in action_topics else "state" if topic in state_topics else "未加载"
-    if result is None:
-        status = "未加载" if all(_supports_ros2(row) for row in topic_inventory) else "不支持的编码"
-    elif result["failed"]:
-        status = "部分解析失败" if result["decoded"] else "解析失败"
-    elif result["decoded"] < sum(row["count"] for row in topic_inventory):
-        status = "部分消息未读出"
-    elif not result["decoded"]:
-        status = "没有读到消息"
-    elif role != "camera" and not result["fields"]:
-        status = "已解析，无数值字段"
-    else:
-        status = "可展示"
-    coverage_rows.append({"topic": topic,
-                          "schema": ", ".join(dict.fromkeys(row["schema"] for row in topic_inventory)),
-                          "recorded": sum(row["count"] for row in topic_inventory),
-                          "role": role, "decoded": result["decoded"] if result else 0,
-                          "failed": result["failed"] if result else 0,
-                          "numeric_dims": len(result["fields"]) if result else 0,
-                          "status": status, "detail": result["error"] if result else ""})
-incomplete = [row for row in coverage_rows if row["status"] != "可展示"]
-st.caption(f"{len(mcap_paths)} 个 MCAP 文件 · {len(available_topics)} 个 topic。可展示表示已加载，相机自动展示，信号需在下方选择维度绘图。")
-if incomplete:
-    st.warning(f"{len({row['topic'] for row in incomplete})} 个 topic 未完整展示，展开清单查看原因。")
-with st.expander("全部 topic / 解析结果", expanded=bool(incomplete)):
-    st.dataframe(coverage_rows, width="stretch", hide_index=True)
-    missing_topics = sorted(set(results) - available_topics)
-    if missing_topics:
-        st.warning("配置的 topic 不在文件中：" + ", ".join(missing_topics))
-for issue in dict.fromkeys([*inventory_issues, *data["read_issues"]]):
-    st.warning(issue)
-if not data["total_step"]:
-    st.error("没有可回放的图像或数值信号，请检查 topic 配置和上方解析结果。")
+action_topics = tuple(dict.fromkeys([*(t.strip() for t in action_topics_str.split(",") if t.strip()), *hand_topics]))
+if set(state_topics) & set(action_topics):
+    st.error("state 和 action 配置了相同 topic，请分别指定实际反馈与 VR 指令来源。")
     st.stop()
-st.caption(f"对齐参考：{data['reference']}。曲线按参考时间轴采样；缺失数据以断线显示。")
+data = load_episode(file_signatures, camera_topics, state_topics, action_topics, hand_topics)
+for issue in dict.fromkeys(data["read_issues"]):
+    st.warning(issue)
+for topic, result in data["topic_results"].items():
+    if result["failed"]:
+        st.warning(f"{topic}：{result['failed']} 条消息解析失败，{result['error']}")
+if not data["total_step"]:
+    st.error("没有可回放的图像或数值信号，请检查 Topic 配置。")
+    st.stop()
 state = data["state"]
 action = data["action"]
 state_names = data["state_names"]
@@ -841,15 +760,6 @@ def _playback_fragment():
         st.session_state.playing = not st.session_state.playing
     st.session_state.fps = st.slider("FPS", 5, 60, st.session_state.fps)
 
-    def move_step(delta):
-        st.session_state.t = min(max(st.session_state.t + delta, 0), T - 1)
-        st.session_state.playing = False
-
-    previous, following = st.columns(2)
-    previous.button("← 上一帧", on_click=move_step, args=(-1,),
-                    disabled=st.session_state.t <= 0, shortcut="Left", width="stretch")
-    following.button("下一帧 →", on_click=move_step, args=(1,),
-                     disabled=st.session_state.t >= T - 1, shortcut="Right", width="stretch")
     if T > 1:
         t_manual = st.slider("Step", 0, T - 1, st.session_state.t)
     else:
@@ -864,7 +774,7 @@ def _playback_fragment():
     # =========================================================
     D_state = state.shape[1] if state.ndim == 2 else 0
     D_action = action.shape[1] if action.ndim == 2 else 0
-    all_dim_labels = [f"S:{n}" for n in state_names] + [f"A:{n}" for n in action_names]
+    all_dim_labels = ordered_signal_labels(state_names, action_names)
     labels = all_dim_labels
     data_labels = labels_with_data(state, state_names, action, action_names)
     default_dims = [label for label in default_selected_dims(state_names, action_names)
@@ -872,7 +782,7 @@ def _playback_fragment():
     multiselect_key = f"selected_dims_{st.session_state.current_episode_key}"
     multiselect_init_key = f"{multiselect_key}_all_data_initialized"
     # Reinitialize when the available fields change; retain intentional empty selections.
-    labels_signature = tuple(sorted(labels))
+    labels_signature = ("vr-feedback-v2", *labels)
     labels_changed = st.session_state.get("dim_labels_signature") != labels_signature
     st.session_state.dim_labels_signature = labels_signature
     if labels_changed:
@@ -897,13 +807,6 @@ def _playback_fragment():
             st.session_state[multiselect_key] = [
                 label for label in st.session_state[multiselect_key] if label in labels
             ]
-    select_all, clear, restore = st.columns(3)
-    if select_all.button("选择全部维度", width="stretch"):
-        st.session_state[multiselect_key] = labels
-    if clear.button("清空选择", width="stretch"):
-        st.session_state[multiselect_key] = []
-    if restore.button("恢复默认配对", width="stretch"):
-        st.session_state[multiselect_key] = default_dims
     selected_dims = st.multiselect(
         "Select state / action dims",
         labels,
@@ -912,22 +815,15 @@ def _playback_fragment():
     st.session_state.selected_dims = selected_dims
 
 
-    st.caption(f"已选 {len(selected_dims)} / {len(labels)} 个数值维度（含关节角、速度、力矩、布尔值）。S 实线为 state，A 浅色点线为 action；同名信号及 pose/target 对使用同一色系。")
+    st.caption("S 实线：机器人实际反馈；A 浅色点线：VR 控制指令。同侧同字段使用同一色系。")
     identities = list(dict.fromkeys(_signal_identity(name) for name in [*state_names, *action_names]))
     signal_colors = {name: qualitative.Dark24[i % len(qualitative.Dark24)] for i, name in enumerate(identities)}
+    legend_order = {label: index for index, label in enumerate(labels)}
 
     def line_style(name, action=False):
         color = signal_colors[_signal_identity(name)]
         return dict(color=_lighter_hex_color(color) if action else color,
                     dash="dot" if action else "solid", width=1.5)
-
-    with st.expander("当前 Step 全部信号数值", expanded=False):
-        st.dataframe([{"role": role, "field": name,
-                       "value": float(matrix[t, i]) if np.isfinite(matrix[t, i]) else None,
-                       "plotted": f"{prefix}:{name}" in selected_dims}
-                      for role, prefix, matrix, names in (("state", "S", state, state_names),
-                                                         ("action", "A", action, action_names))
-                      for i, name in enumerate(names)], width="stretch", hide_index=True)
 
     camera_names = list(cameras)
     camera_columns = st.columns(min(3, len(camera_names))) if camera_names else []
@@ -1015,12 +911,14 @@ def _playback_fragment():
             label = f"S:{state_names[i]}"
             if label in selected_dims:
                 fig_plotly.add_trace(go.Scatter(x=plot_x, y=state[:, i], name=label,
-                                               line=line_style(state_names[i]), connectgaps=False))
+                                               line=line_style(state_names[i]), connectgaps=False,
+                                               legendrank=legend_order[label]))
         for i in range(D_action):
             label = f"A:{action_names[i]}"
             if label in selected_dims:
                 fig_plotly.add_trace(go.Scatter(x=plot_x, y=action[:, i], name=label,
-                                               line=line_style(action_names[i], action=True), connectgaps=False))
+                                               line=line_style(action_names[i], action=True), connectgaps=False,
+                                               legendrank=legend_order[label]))
         for tpc, spans in gap_spans_by_topic.items():
             style = topic_style[tpc]
             _add_gap_lines(
@@ -1055,6 +953,7 @@ def _playback_fragment():
                 fig_plotly.add_trace(go.Scatter(
                     x=plot_x, y=state[x0:x1, i], name=label,
                     mode="lines", line=line_style(state_names[i]), connectgaps=False,
+                    legendrank=legend_order[label],
                 ))
         for i in range(D_action):
             label = f"A:{action_names[i]}"
@@ -1062,6 +961,7 @@ def _playback_fragment():
                 fig_plotly.add_trace(go.Scatter(
                     x=plot_x, y=action[x0:x1, i], name=label,
                     mode="lines", line=line_style(action_names[i], action=True), connectgaps=False,
+                    legendrank=legend_order[label],
                 ))
         fig_plotly.add_vline(x=t, line_color="red", line_width=2)
         fig_plotly.update_layout(
