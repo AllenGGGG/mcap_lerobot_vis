@@ -4,17 +4,22 @@ import os
 import glob
 import struct
 import sys
-import time
 from array import array
 from pathlib import Path
 import numpy as np
 import cv2
 import streamlit as st
 import plotly.graph_objects as go
-from plotly.colors import qualitative
 from mcap.reader import make_reader, NonSeekingReader
 from mcap.exceptions import McapError, EndOfFile
 from mcap_ros2.decoder import DecoderFactory
+from smooth_player import (select_signal_dimensions, SIGNAL_PALETTE,
+                           lighter_signal_color as _lighter_hex_color)
+from mcap_video import show_mcap_smooth_player
+from mcap_joint_signals import (
+    COMMAND_TOPICS, NAMES_TOPIC, JOINT_TOPIC, CommandDecoder,
+    joint_positions, signal_identity, display_label,
+)
 
 MCAP_READ_ERRORS = (McapError, EndOfFile, struct.error)
 # =========================================================
@@ -41,23 +46,18 @@ DEFAULT_CAMERA_TOPICS = {
     "head": "/camera_head/color/image_raw/compressed",
     "right_wrist": "/camera_right_wrist/color/image_raw/compressed",
 }
-DEFAULT_STATE_TOPICS = ["/left_current_pose", "/right_current_pose", "/body_current_pose", "/joint_states"]
-DEFAULT_ACTION_TOPICS = ["/left_current_target", "/right_current_target"]
-DEFAULT_HAND_TOPICS = ["/left_hand_controller/target_percent", "/right_hand_controller/target_percent"]
+DEFAULT_STATE_TOPICS = [JOINT_TOPIC]
+DEFAULT_ACTION_TOPICS = list(COMMAND_TOPICS)
 # 相机画面统一 resize 到的尺寸 (width, height)，VLA 模型输入常用 224x224
 IMAGE_RESIZE_SIZE = (224, 224)
 # 标称频率：仅用于 Data Health 表里的"整体是否达标" coverage 对比，不参与逐 step 缺帧判定
 # （逐 step 判定继续用各 topic 自己的自适应容差，见 _alignment_tolerance_ns）
 NOMINAL_HZ_CAMERA = 30
-NOMINAL_HZ_JOINT = 100
-NOMINAL_HZ_HAND = 10
-# 手控 session 间隔阈值：两条消息之间超过此值视为不同 session（session 间静默不是丢帧）
-SESSION_GAP_NS = 300_000_000  # 300 ms
+NOMINAL_HZ_JOINT = 500
 # 缺帧容差倍数：相邻/最近邻时间差超过 (该 topic 自适应周期 × 这个倍数) 就判定为缺帧
 GAP_TOLERANCE_MULTIPLIER = 1.5
 # Plotly 图上最多渲染多少段丢帧竖线，避免极端情况下卡顿
 MAX_RENDERED_GAPS = 80
-PLAYBACK_PLOT_HALF_WINDOW = 120
 
 
 # =========================================================
@@ -93,36 +93,6 @@ def _iter_mcap_messages(path, topics=None, issues=None):
                 issues.append(f"{Path(path).name} 读取中断，仅展示已读数据：{type(exc).__name__}")
 
 
-def _sequence_items(value):
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, array):
-        return list(value)
-    if isinstance(value, (list, tuple)):
-        return list(value)
-    return None
-
-
-def _flatten_joint_state(msg, prefix=""):
-    names = _sequence_items(getattr(msg, "name", None))
-    if names is None:
-        return None
-    out = {}
-    for field in ("position", "velocity", "effort"):
-        values = _sequence_items(getattr(msg, field, None))
-        if values is None:
-            continue
-        for i, value in enumerate(values):
-            if isinstance(value, bool):
-                continue
-            if not isinstance(value, (int, float, np.integer, np.floating)):
-                continue
-            joint_name = str(names[i]) if i < len(names) and names[i] else f"[{i}]"
-            key = f"{field}.{joint_name}" if not joint_name.startswith("[") else f"{field}{joint_name}"
-            out[f"{prefix}.{key}" if prefix else key] = float(value)
-    return out or None
-
-
 def _flatten(msg, prefix=""):
     """递归展开一个 decode 后的 ros2 消息为 {字段路径: float} 的字典。
     跳过消息头、字符串及字节等非信号字段。"""
@@ -138,9 +108,6 @@ def _flatten(msg, prefix=""):
         for i, v in enumerate(msg):
             out.update(_flatten(v, f"{prefix}[{i}]"))
         return out
-    joint_state = _flatten_joint_state(msg, prefix)
-    if joint_state is not None:
-        return joint_state
     attrs = getattr(msg, "__dict__", None)
     slots = getattr(msg, "__slots__", None)
     if slots:
@@ -201,24 +168,16 @@ def labels_with_data(state, state_names, action, action_names):
 
 
 def _signal_identity(name):
-    topic, separator, field = name.partition(".")
-    # Explicit pairs from the controller's PoseStamped publishers; never infer
-    # pairs from a generic "target" substring or copy feedback into action.
-    topic = {"/left_current_target": "/left_current_pose",
-             "/right_current_target": "/right_current_pose"}.get(topic, topic)
-    return topic + separator + field
+    return signal_identity(name)
 
 
 def default_selected_dims(state_names, action_names, limit=8):
     states = {_signal_identity(name): f"S:{name}" for name in state_names}
     actions = {_signal_identity(name): f"A:{name}" for name in action_names}
     pairs = [name for name in states if name in actions]
-    position_pairs = [name for name in pairs if name.endswith(
-        (".position.x", ".position.y", ".position.z"))]
-    if position_pairs:
-        # Keep left/right XYZ complete rather than selecting three left axes
-        # and a single right axis just to fill a four-pair limit.
-        return [label for name in position_pairs for label in (states[name], actions[name])]
+    joint_order = ["body_joint3", "body_joint4", *[f"left_joint{i}" for i in range(1, 8)],
+                   *[f"right_joint{i}" for i in range(1, 8)]]
+    pairs.sort(key=lambda name: (joint_order.index(name) if name in joint_order else len(joint_order), name))
     if pairs:
         return [label for name in pairs[:max(limit // 2, 1)] for label in (states[name], actions[name])]
     return list(states.values())[:max(limit // 2, 1)] + list(actions.values())[:max(limit // 2, 1)]
@@ -232,10 +191,6 @@ def ordered_signal_labels(state_names, action_names):
             groups.setdefault(_signal_identity(name), []).append(f"{prefix}:{name}")
     return [label for labels in groups.values() for label in labels]
 
-
-def _lighter_hex_color(color, amount=0.3):
-    rgb = [int(color[i:i + 2], 16) for i in (1, 3, 5)]
-    return "rgb(" + ", ".join(str(round(c + (255 - c) * amount)) for c in rgb) + ")"
 
 
 def _median_period_ns(times):
@@ -253,47 +208,6 @@ def _alignment_tolerance_ns(source_times, target_times):
     if not periods:
         return 50_000_000  # 50 ms fallback for sparse/short topics.
     return int(max(periods) * GAP_TOLERANCE_MULTIPLIER)
-
-
-def _hand_session_analysis(source_times, master_times):
-    """手控 topic session 分析。手控数据按操作片段发布，session 间静默不算丢帧。
-
-    返回 (valid_mask, active_mask)：
-      valid_mask  [T] bool：有有效插值数据（session 内且距最近消息 ≤ intra_tol）
-      active_mask [T] bool：处于某个 session 活跃窗口内（用于 coverage 和丢帧判定）
-    """
-    src = np.array(source_times, dtype=np.int64)
-    mst = np.array(master_times, dtype=np.int64)
-    T_len = len(mst)
-    if len(src) == 0:
-        return np.zeros(T_len, dtype=bool), np.zeros(T_len, dtype=bool)
-    # 按 SESSION_GAP_NS 切割成 session
-    if len(src) > 1:
-        gaps = np.diff(src)
-        breaks = np.where(gaps > SESSION_GAP_NS)[0]
-        s_starts = np.concatenate([[0], breaks + 1])
-        s_ends = np.concatenate([breaks, [len(src) - 1]])
-        intra_diffs = gaps[gaps <= SESSION_GAP_NS]
-    else:
-        s_starts, s_ends = np.array([0]), np.array([0])
-        intra_diffs = np.array([], dtype=np.int64)
-    # 按压内容差：intra 消息间隔中位数 × 1.5；fallback 取标称半周期与 session 间隔的一半中的较小值，
-    # 防止单条消息的 active 窗口跨越到下一个按压的范围内。
-    intra_tol = (int(np.median(intra_diffs) * 1.5) if len(intra_diffs) > 0
-                 else min(round(1e9 / NOMINAL_HZ_HAND), SESSION_GAP_NS // 2))
-    # active 窗口：每个 session 的 [t_start - intra_tol, t_end + intra_tol]
-    active_mask = np.zeros(T_len, dtype=bool)
-    for si, ei in zip(s_starts, s_ends):
-        lo = np.searchsorted(mst, int(src[si]) - intra_tol)
-        hi = np.searchsorted(mst, int(src[ei]) + intra_tol, side='right')
-        active_mask[lo:hi] = True
-    # valid = active 且距最近消息 ≤ intra_tol
-    right = np.searchsorted(src, mst)
-    left = np.clip(right - 1, 0, len(src) - 1)
-    right = np.clip(right, 0, len(src) - 1)
-    dist = np.minimum(np.abs(mst - src[left]), np.abs(src[right] - mst))
-    valid_mask = active_mask & (dist <= intra_tol)
-    return valid_mask, active_mask
 
 
 def _nearest_alignment(source_times, target_times, tolerance_ns):
@@ -460,15 +374,19 @@ def _topic_stats(times):
 
 
 @st.cache_data(max_entries=2, show_spinner="Decoding MCAP episode...")
-def load_episode(file_signatures, camera_topics: dict, state_topics: tuple, action_topics: tuple, hand_topics: tuple = ()):
+def load_episode(file_signatures, camera_topics: dict, state_topics: tuple, action_topics: tuple):
     camera_data = {name: [] for name in camera_topics}
     camera_times = {name: [] for name in camera_topics}
     signal_series = {}
     wanted_topics = set(camera_topics.values()) | set(state_topics) | set(action_topics)
+    if COMMAND_TOPICS[1] in wanted_topics:
+        wanted_topics.add(NAMES_TOPIC)
     read_issues = []
     topic_results = {topic: {"failed": 0, "error": ""}
                      for topic in wanted_topics}
     camera_names = {topic: name for name, topic in camera_topics.items()}
+    command_decoder = CommandDecoder()
+    stale_commands = 0
     for path, _, _ in file_signatures:
         # Schema IDs are local to each file; do not share decoder caches across shards.
         factory = DecoderFactory()
@@ -481,7 +399,16 @@ def load_episode(file_signatures, camera_topics: dict, state_topics: tuple, acti
                     raise ValueError("不支持的消息或 schema 编码")
                 ros_msg = decoder(message.data)
                 t_ns = _message_time_ns(ros_msg, message)
-                if topic in camera_names:
+                if topic == NAMES_TOPIC or topic in COMMAND_TOPICS:
+                    if topic != NAMES_TOPIC and abs(t_ns - message.log_time) > 1_000_000_000:
+                        # Transient-local statistics include one old sample on subscription.
+                        # These recordings contain samples 5–31 seconds before the episode.
+                        stale_commands += 1
+                        continue
+                    for source_topic, source_time, flat in command_decoder.consume(topic, ros_msg, t_ns):
+                        if flat:
+                            signal_series.setdefault(source_topic, []).append((source_time, flat))
+                elif topic in camera_names:
                     img = _decode_image(ros_msg)
                     if img is None:
                         raise ValueError("图像解码失败")
@@ -489,12 +416,17 @@ def load_episode(file_signatures, camera_topics: dict, state_topics: tuple, acti
                     camera_data[cam_name].append(img)
                     camera_times[cam_name].append(t_ns)
                 else:
-                    flat = _flatten(ros_msg)
+                    flat = joint_positions(ros_msg) if topic == JOINT_TOPIC else _flatten(ros_msg)
                     signal_series.setdefault(topic, []).append((t_ns, flat))
             except Exception as exc:
                 # A bad/custom topic must not suppress all other recorded signals.
                 result["failed"] += 1
                 result["error"] = f"{type(exc).__name__}: {str(exc)[:180]}"
+    if command_decoder.pending:
+        read_issues.append("部分关节指令缺少匹配的 StatisticsNames，未按数组下标猜测关节名："
+                           + ", ".join(map(str, command_decoder.pending)))
+    if stale_commands:
+        read_issues.append(f"已排除 {stale_commands} 条订阅时带入的旧控制器统计消息，避免拉长录制时间轴。")
     # log_time_order=False 按物理写入顺序返回消息，正常情况下同一个 topic 内部
     # 已经是按时间递增的，但仍显式排序，供 np.searchsorted 对齐使用。
     for cam_name in list(camera_times.keys()):
@@ -560,57 +492,37 @@ def load_episode(file_signatures, camera_topics: dict, state_topics: tuple, acti
         camera_raw_indices[cam_name] = [int(i) for i in raw_idx]
         camera_raw_delta_ms[cam_name] = [float(v) for v in raw_delta_ms]
 
-    hand_topics_set = frozenset(hand_topics)
-
     def build_matrix(topics):
         names, columns = [], []
         masks = {}
-        active_masks = {}
         for topic in topics:
             series = signal_series.get(topic, [])
             if not series:
                 continue
             times_arr = np.array([t for t, _ in series], dtype=np.int64)
             all_keys = sorted({key for _, flat in series for key in flat.keys()})
-            if topic in hand_topics_set:
-                valid, active = _hand_session_analysis(times_arr, master_times)
-                masks[topic] = valid    # 用于 stats 里检测按压期间的真实丢帧
-                active_masks[topic] = active
-                if not all_keys:
-                    continue
-                for key in all_keys:
-                    names.append(f"{topic}.{key}" if key else topic)
-                    raw_vals = np.array([flat.get(key, np.nan) for _, flat in series], dtype=float)
-                    # np.interp 边界外会外推端点值，但 active 窗口外随即被覆盖为 0
-                    interp_vals = np.interp((master_times - times_arr[0]).astype(float),
-                                            (times_arr - times_arr[0]).astype(float), raw_vals)
-                    interp_vals[active & ~valid] = np.nan
-                    interp_vals[~active] = 0.0  # 按压之外填 0
-                    columns.append(interp_vals)
-            else:
-                tolerance_ns = _alignment_tolerance_ns(times_arr, master_times)
-                idx, _, valid, _, _ = _nearest_alignment(times_arr, master_times, tolerance_ns)
-                masks[topic] = valid
-                if not all_keys:
-                    continue
-                for key in all_keys:
-                    names.append(f"{topic}.{key}" if key else topic)
-                    raw_vals = np.array([flat.get(key, np.nan) for _, flat in series], dtype=float)
-                    aligned_vals = np.full(T, np.nan, dtype=float)
-                    valid_idx = valid & (idx >= 0)
-                    aligned_vals[valid_idx] = raw_vals[idx[valid_idx]]
-                    columns.append(aligned_vals)
+            tolerance_ns = _alignment_tolerance_ns(times_arr, master_times)
+            idx, _, valid, _, _ = _nearest_alignment(times_arr, master_times, tolerance_ns)
+            masks[topic] = valid
+            for key in all_keys:
+                names.append(f"{topic}.{key}" if key else topic)
+                raw_vals = np.array([flat.get(key, np.nan) for _, flat in series], dtype=float)
+                aligned_vals = np.full(T, np.nan, dtype=float)
+                valid_idx = valid & (idx >= 0)
+                aligned_vals[valid_idx] = raw_vals[idx[valid_idx]]
+                columns.append(aligned_vals)
         if not columns:
-            return np.zeros((T, 0)), [], masks, active_masks
-        return np.stack(columns, axis=1), names, masks, active_masks
+            return np.zeros((T, 0)), [], masks
+        return np.stack(columns, axis=1), names, masks
 
-    state, state_names, state_masks, state_active = build_matrix(state_topics)
-    action, action_names, action_masks, action_active = build_matrix(action_topics)
+    state, state_names, state_masks = build_matrix(state_topics)
+    action, action_names, action_masks = build_matrix(action_topics)
     signal_masks = {**state_masks, **action_masks}
-    hand_active_masks = {**state_active, **action_active}
     camera_stats = {}
     camera_gap_spans = {}
     for name in camera_times:
+        if not camera_times[name]:
+            continue  # An absent camera is not a whole episode of dropped images.
         valid_mask = np.array(camera_valid[name], dtype=bool)
         spans = _missing_runs(~valid_mask)
         camera_stats[f"camera:{name}"] = _health_row(camera_times[name], spans, NOMINAL_HZ_CAMERA)
@@ -620,23 +532,8 @@ def load_episode(file_signatures, camera_topics: dict, state_topics: tuple, acti
     for topic, series in signal_series.items():
         times = [t for t, _ in series]
         valid_mask = signal_masks.get(topic)
-        if topic in hand_topics_set:
-            active_mask = hand_active_masks.get(topic)
-            # 丢帧：按压期间距最近消息超过 intra_tol 的 master 步
-            # valid_mask = active & close；active & ~valid = active but not close
-            if active_mask is not None and valid_mask is not None:
-                intra_missing = active_mask & ~valid_mask
-            else:
-                intra_missing = np.zeros(T, dtype=bool)
-            spans = _missing_runs(intra_missing)
-            row = _health_row(times, spans, NOMINAL_HZ_HAND)
-            # coverage = session 活跃时间占比（不是 source_hz/nominal）
-            if active_mask is not None and len(active_mask) > 0:
-                row["coverage"] = float(np.sum(active_mask)) / len(active_mask)
-            signal_stats[topic] = row
-        else:
-            spans = _missing_runs(~valid_mask) if valid_mask is not None else []
-            signal_stats[topic] = _health_row(times, spans, NOMINAL_HZ_JOINT)
+        spans = _missing_runs(~valid_mask) if valid_mask is not None else []
+        signal_stats[topic] = _health_row(times, spans, NOMINAL_HZ_JOINT)
         if spans:
             all_keys = sorted({key for _, flat in series for key in flat.keys()})
             if all_keys:
@@ -681,23 +578,21 @@ file_signatures = tuple((path, os.stat(path).st_size, os.stat(path).st_mtime_ns)
 for path in mcap_paths:
     st.sidebar.caption(path)
 with st.sidebar.expander("Topic 配置", expanded=False):
-    st.caption("S 为机器人实际反馈，A 为 VR 控制指令。这里只读取明确配置的 topic。")
+    st.caption("S 读取 /joint_states 的位置反馈；A 读取控制器统计中的 command_interface 位置指令。")
     left_wrist_topic = st.text_input("left_wrist topic", DEFAULT_CAMERA_TOPICS["left_wrist"])
     head_topic = st.text_input("head topic", DEFAULT_CAMERA_TOPICS["head"])
     right_wrist_topic = st.text_input("right_wrist topic", DEFAULT_CAMERA_TOPICS["right_wrist"])
     state_topics_str = st.text_input("state topics (逗号分隔)", ",".join(DEFAULT_STATE_TOPICS))
     action_topics_str = st.text_input("action topics (逗号分隔)", ",".join(DEFAULT_ACTION_TOPICS))
-    hand_topics_str = st.text_input("hand topics (逗号分隔)", ",".join(DEFAULT_HAND_TOPICS))
 camera_topics = {name: topic.strip() for name, topic in (
     ("left_wrist", left_wrist_topic), ("head", head_topic), ("right_wrist", right_wrist_topic)
 ) if topic.strip()}
 state_topics = tuple(dict.fromkeys(t.strip() for t in state_topics_str.split(",") if t.strip()))
-hand_topics = tuple(dict.fromkeys(t.strip() for t in hand_topics_str.split(",") if t.strip()))
-action_topics = tuple(dict.fromkeys([*(t.strip() for t in action_topics_str.split(",") if t.strip()), *hand_topics]))
+action_topics = tuple(dict.fromkeys(t.strip() for t in action_topics_str.split(",") if t.strip()))
 if set(state_topics) & set(action_topics):
-    st.error("state 和 action 配置了相同 topic，请分别指定实际反馈与 VR 指令来源。")
+    st.error("state 和 action 配置了相同 topic，请分别指定实际反馈与控制器指令来源。")
     st.stop()
-data = load_episode(file_signatures, camera_topics, state_topics, action_topics, hand_topics)
+data = load_episode(file_signatures, camera_topics, state_topics, action_topics)
 for issue in dict.fromkeys(data["read_issues"]):
     st.warning(issue)
 for topic, result in data["topic_results"].items():
@@ -710,6 +605,8 @@ state = data["state"]
 action = data["action"]
 state_names = data["state_names"]
 action_names = data["action_names"]
+if not action_names:
+    st.warning("没有解析到关节位置指令，请检查控制器统计 topic；不会用 state 代替 Action。")
 T = data["total_step"]
 cameras = data["cameras"]
 camera_indices = data["camera_indices"]
@@ -722,110 +619,70 @@ master_times = data["master_times"]
 stats = data["stats"]
 signal_gap_spans = data.get("signal_gap_spans", {})
 # =========================================================
-# Episode change detection
+# Episode changes reset the cursor, while the saved semantic signal IDs survive.
 # =========================================================
 episode_key = repr((root_dir, episode_id, file_signatures))
-if "current_episode_key" not in st.session_state:
-    st.session_state.current_episode_key = episode_key
-if st.session_state.current_episode_key != episode_key:
+if st.session_state.get("current_episode_key") != episode_key:
     st.session_state.current_episode_key = episode_key
     st.session_state.t = 0
-    st.session_state.playing = False
-    st.session_state.selected_dims = default_selected_dims(state_names, action_names)
-    st.rerun()
-# =========================================================
-# Session state
-# =========================================================
-if "t" not in st.session_state:
-    head_frames = cameras.get("head", [])
-    first_real = next((i for i, img in enumerate(head_frames) if img is not None), 0)
-    st.session_state.t = first_real
-if "playing" not in st.session_state:
-    st.session_state.playing = False
-if "fps" not in st.session_state:
-    st.session_state.fps = 30
-st.session_state.t = min(st.session_state.t, T - 1) if T > 0 else 0
-t = st.session_state.t
-# =========================================================
-# Playback + Cameras
-# =========================================================
-# 播放期间仅刷新控制、相机和窗口内曲线，避免重建整段曲线与健康统计。
-@st.fragment
-def _playback_fragment():
-    st.markdown("## Img/state/action")
-    # 用一个按钮在 Play/Pause 之间切换，而不是同时摆两个按钮——
-    # 当前状态已经决定了哪个动作有意义，没必要两个都常驻显示。
-    toggle_label = "⏸ Pause" if st.session_state.playing else "▶ Play"
-    if st.button(toggle_label, width="stretch"):
-        st.session_state.playing = not st.session_state.playing
-    st.session_state.fps = st.slider("FPS", 5, 60, st.session_state.fps)
+    st.session_state.mcap_step = 0
+st.session_state.t = min(st.session_state.get("t", 0), max(T - 1, 0))
 
+st.markdown("## 流畅播放")
+D_state = state.shape[1]
+D_action = action.shape[1]
+labels = ordered_signal_labels(state_names, action_names)
+data_labels = labels_with_data(state, state_names, action, action_names)
+default_dims = [label for label in default_selected_dims(state_names, action_names)
+                if label in data_labels] or data_labels[:8]
+selected_dims = select_signal_dimensions(
+    labels, default_dims, key="mcap_selected_dims", display_func=display_label,
+    previous=st.session_state.get("selected_dims"),
+)
+st.session_state.selected_dims = list(selected_dims)
+st.caption(f"S 实线：实测关节位置（{D_state} 维）；A 浅色点线：控制器关节位置指令（{D_action} 维）。同名关节配对。")
+identities = list(dict.fromkeys(_signal_identity(name) for name in [*state_names, *action_names]))
+signal_colors = {name: SIGNAL_PALETTE[i % len(SIGNAL_PALETTE)] for i, name in enumerate(identities)}
+legend_order = {label: index for index, label in enumerate(labels)}
+
+
+def line_style(name, action=False):
+    color = signal_colors[_signal_identity(name)]
+    return dict(color=_lighter_hex_color(color) if action else color,
+                dash="dot" if action else "solid", width=2)
+
+
+signal_values = {f"S:{name}": state[:, i] for i, name in enumerate(state_names)}
+signal_values.update({f"A:{name}": action[:, i] for i, name in enumerate(action_names)})
+player_traces = [
+    {"name": display_label(label), "color": line_style(label[2:], label.startswith("A:"))["color"],
+     "dashed": label.startswith("A:"), "values": signal_values[label]}
+    for label in labels if label in selected_dims
+]
+show_mcap_smooth_player((file_signatures, tuple(camera_topics.items())), cameras, master_times,
+                        player_traces, st.session_state.t)
+
+
+@st.fragment
+def _inspection_fragment():
+    st.markdown("### 逐帧查看")
+
+    def step_frame(delta):
+        st.session_state.t = min(max(st.session_state.t + delta, 0), T - 1)
+        st.session_state.mcap_step = st.session_state.t
+
+    previous, following = st.columns(2)
+    previous.button("← Previous frame", key="mcap_previous_frame", on_click=step_frame,
+                    args=(-1,), disabled=st.session_state.t <= 0, shortcut="Left", width="stretch")
+    following.button("Next frame →", key="mcap_next_frame", on_click=step_frame,
+                     args=(1,), disabled=st.session_state.t >= T - 1, shortcut="Right", width="stretch")
+    st.caption("上方可连续播放关节曲线；这里可以拖动 Step 或用 ←/→ 逐帧细看。")
     if T > 1:
-        t_manual = st.slider("Step", 0, T - 1, st.session_state.t)
+        st.session_state.t = st.slider("Step", 0, T - 1, key="mcap_step")
     else:
         st.caption("Step 0（仅一帧）")
-        t_manual = 0
-    if t_manual != st.session_state.t:
-        st.session_state.t = t_manual
-        st.session_state.playing = False
     t = st.session_state.t
-    # =========================================================
-    # State / Action selection
-    # =========================================================
-    D_state = state.shape[1] if state.ndim == 2 else 0
-    D_action = action.shape[1] if action.ndim == 2 else 0
-    all_dim_labels = ordered_signal_labels(state_names, action_names)
-    labels = all_dim_labels
-    data_labels = labels_with_data(state, state_names, action, action_names)
-    default_dims = [label for label in default_selected_dims(state_names, action_names)
-                    if label in data_labels] or data_labels[:8]
-    multiselect_key = f"selected_dims_{st.session_state.current_episode_key}"
-    multiselect_init_key = f"{multiselect_key}_all_data_initialized"
-    # Reinitialize when the available fields change; retain intentional empty selections.
-    labels_signature = ("vr-feedback-v2", *labels)
-    labels_changed = st.session_state.get("dim_labels_signature") != labels_signature
-    st.session_state.dim_labels_signature = labels_signature
-    if labels_changed:
-        st.session_state.selected_dims = default_dims
-        st.session_state[multiselect_key] = default_dims
-        st.session_state[multiselect_init_key] = True
-    else:
-        # 注意：这里不能"选择变空就回填默认值"——用户手动把最后一个 tag 删掉、
-        # 故意清空选择时，selected_dims/multiselect_key 也会变空，那是合法状态，
-        # 不是 bug，不该被强制改回去。真正需要回填默认值的场景("topic 配置变了、
-        # 选项被过滤掉了")已经在上面 labels_changed 分支单独处理。
-        if "selected_dims" not in st.session_state:
-            st.session_state.selected_dims = default_dims
-        else:
-            st.session_state.selected_dims = [
-                label for label in st.session_state.selected_dims if label in labels
-            ]
-        if multiselect_key not in st.session_state or not st.session_state.get(multiselect_init_key):
-            st.session_state[multiselect_key] = st.session_state.selected_dims
-            st.session_state[multiselect_init_key] = True
-        else:
-            st.session_state[multiselect_key] = [
-                label for label in st.session_state[multiselect_key] if label in labels
-            ]
-    selected_dims = st.multiselect(
-        "Select state / action dims",
-        labels,
-        key=multiselect_key,
-    )
-    st.session_state.selected_dims = selected_dims
-
-
-    st.caption("S 实线：机器人实际反馈；A 浅色点线：VR 控制指令。同侧同字段使用同一色系。")
-    identities = list(dict.fromkeys(_signal_identity(name) for name in [*state_names, *action_names]))
-    signal_colors = {name: qualitative.Dark24[i % len(qualitative.Dark24)] for i, name in enumerate(identities)}
-    legend_order = {label: index for index, label in enumerate(labels)}
-
-    def line_style(name, action=False):
-        color = signal_colors[_signal_identity(name)]
-        return dict(color=_lighter_hex_color(color) if action else color,
-                    dash="dot" if action else "solid", width=1.5)
-
-    camera_names = list(cameras)
+    camera_names = [name for name in cameras if camera_counts.get(name, 0) > 0]
     camera_columns = st.columns(min(3, len(camera_names))) if camera_names else []
     for index, cam_name in enumerate(camera_names):
         col = camera_columns[index % len(camera_columns)]
@@ -866,128 +723,84 @@ def _playback_fragment():
     # "img/state/action" 一个标题下，这里不再单独起标题。
     # =========================================================
 
-    if not st.session_state.playing:
-        def _label_topic(label):
-            return label[2:].split(".", 1)[0]
+    def _label_topic(label):
+        return label[2:].split(".", 1)[0]
 
-        topics_in_view = [
-            tpc for tpc in (list(state_topics) + list(action_topics)) if any(_label_topic(l) == tpc for l in selected_dims)
-        ]
-        _GAP_COLOR_PALETTE = [
-            "rgb(220, 38, 38)",
-            "rgb(37, 99, 235)",
-            "rgb(217, 119, 6)",
-            "rgb(5, 150, 105)",
-            "rgb(147, 51, 234)",
-        ]
-        n_lanes = max(len(topics_in_view), 1)
-        lane_height = (0.95 - 0.05) / n_lanes
-        topic_style = {
-            tpc: {
-                "y0": 0.05 + i * lane_height,
-                "y1": 0.05 + (i + 1) * lane_height,
-                "color": _GAP_COLOR_PALETTE[i % len(_GAP_COLOR_PALETTE)],
-            }
-            for i, tpc in enumerate(topics_in_view)
+    topics_in_view = [
+        tpc for tpc in (list(state_topics) + list(action_topics)) if any(_label_topic(l) == tpc for l in selected_dims)
+    ]
+    _GAP_COLOR_PALETTE = [
+        "rgb(220, 38, 38)",
+        "rgb(37, 99, 235)",
+        "rgb(217, 119, 6)",
+        "rgb(5, 150, 105)",
+        "rgb(171, 139, 204)",
+    ]
+    n_lanes = max(len(topics_in_view), 1)
+    lane_height = (0.95 - 0.05) / n_lanes
+    topic_style = {
+        tpc: {
+            "y0": 0.05 + i * lane_height,
+            "y1": 0.05 + (i + 1) * lane_height,
+            "color": _GAP_COLOR_PALETTE[i % len(_GAP_COLOR_PALETTE)],
         }
+        for i, tpc in enumerate(topics_in_view)
+    }
 
-        gap_spans_by_topic = {}
-        for label in selected_dims:
-            if not label.startswith(("S:", "A:")):
+    gap_spans_by_topic = {}
+    for label in selected_dims:
+        if not label.startswith(("S:", "A:")):
+            continue
+        series_name = label[2:]
+        tpc = _label_topic(label)
+        seen_in_topic = {(s["x0"], s["x1"]) for s in gap_spans_by_topic.get(tpc, [])}
+        for span in signal_gap_spans.get(series_name, [])[:MAX_RENDERED_GAPS]:
+            key = (span["x0"], span["x1"])
+            if key in seen_in_topic:
                 continue
-            series_name = label[2:]
-            tpc = _label_topic(label)
-            seen_in_topic = {(s["x0"], s["x1"]) for s in gap_spans_by_topic.get(tpc, [])}
-            for span in signal_gap_spans.get(series_name, [])[:MAX_RENDERED_GAPS]:
-                key = (span["x0"], span["x1"])
-                if key in seen_in_topic:
-                    continue
-                seen_in_topic.add(key)
-                gap_spans_by_topic.setdefault(tpc, []).append(span)
+            seen_in_topic.add(key)
+            gap_spans_by_topic.setdefault(tpc, []).append(span)
 
-        plot_x = np.arange(T)
-        fig_plotly = go.Figure()
-        for i in range(D_state):
-            label = f"S:{state_names[i]}"
-            if label in selected_dims:
-                fig_plotly.add_trace(go.Scatter(x=plot_x, y=state[:, i], name=label,
-                                               line=line_style(state_names[i]), connectgaps=False,
-                                               legendrank=legend_order[label]))
-        for i in range(D_action):
-            label = f"A:{action_names[i]}"
-            if label in selected_dims:
-                fig_plotly.add_trace(go.Scatter(x=plot_x, y=action[:, i], name=label,
-                                               line=line_style(action_names[i], action=True), connectgaps=False,
-                                               legendrank=legend_order[label]))
-        for tpc, spans in gap_spans_by_topic.items():
-            style = topic_style[tpc]
-            _add_gap_lines(
-                fig_plotly,
-                spans[:MAX_RENDERED_GAPS],
-                y0=style["y0"],
-                y1=style["y1"],
-                color=style["color"],
-                label_prefix=f"{tpc} ",
-            )
-        fig_plotly.add_vline(x=t, line_color="red", line_width=2)
-        fig_plotly.update_layout(
-            height=350,
-            dragmode="select",
-            xaxis_title="Step",
-            hovermode="x",
-        )
-        fig_plotly.update_xaxes(showspikes=True, spikemode="across", spikesnap="cursor", showline=True)
-        st.plotly_chart(
+    plot_x = np.arange(T)
+    fig_plotly = go.Figure()
+    for i in range(D_state):
+        label = f"S:{state_names[i]}"
+        if label in selected_dims:
+            fig_plotly.add_trace(go.Scatter(x=plot_x, y=state[:, i], name=display_label(label),
+                                           line=line_style(state_names[i]), connectgaps=False,
+                                           legendrank=legend_order[label]))
+    for i in range(D_action):
+        label = f"A:{action_names[i]}"
+        if label in selected_dims:
+            fig_plotly.add_trace(go.Scatter(x=plot_x, y=action[:, i], name=display_label(label),
+                                           line=line_style(action_names[i], action=True), connectgaps=False,
+                                           legendrank=legend_order[label]))
+    for tpc, spans in gap_spans_by_topic.items():
+        style = topic_style[tpc]
+        _add_gap_lines(
             fig_plotly,
-            width="stretch",
-            key=f"mcap_signal_plot_{st.session_state.current_episode_key}",
+            spans[:MAX_RENDERED_GAPS],
+            y0=style["y0"],
+            y1=style["y1"],
+            color=style["color"],
+            label_prefix=f"{tpc} ",
         )
-    else:
-        x0 = max(0, t - PLAYBACK_PLOT_HALF_WINDOW)
-        x1 = min(T, t + PLAYBACK_PLOT_HALF_WINDOW + 1)
-        plot_x = np.arange(x0, x1)
-        fig_plotly = go.Figure()
-        for i in range(D_state):
-            label = f"S:{state_names[i]}"
-            if label in selected_dims:
-                fig_plotly.add_trace(go.Scatter(
-                    x=plot_x, y=state[x0:x1, i], name=label,
-                    mode="lines", line=line_style(state_names[i]), connectgaps=False,
-                    legendrank=legend_order[label],
-                ))
-        for i in range(D_action):
-            label = f"A:{action_names[i]}"
-            if label in selected_dims:
-                fig_plotly.add_trace(go.Scatter(
-                    x=plot_x, y=action[x0:x1, i], name=label,
-                    mode="lines", line=line_style(action_names[i], action=True), connectgaps=False,
-                    legendrank=legend_order[label],
-                ))
-        fig_plotly.add_vline(x=t, line_color="red", line_width=2)
-        fig_plotly.update_layout(
-            height=350,
-            xaxis_title="Step",
-            hovermode=False,
-            showlegend=True,
-        )
-        fig_plotly.update_xaxes(range=[x0, max(x1 - 1, x0)], showspikes=False)
-        st.plotly_chart(
-            fig_plotly,
-            width="stretch",
-            key=f"mcap_signal_plot_{st.session_state.current_episode_key}",
-            config={"displayModeBar": False},
-        )
-
-    if st.session_state.playing and T > 0:
-        time.sleep(1.0 / st.session_state.fps)
-        st.session_state.t += 1
-        if st.session_state.t >= T:
-            st.session_state.t = T - 1
-            st.session_state.playing = False
-        st.rerun(scope="fragment")
+    fig_plotly.add_vline(x=t, line_color="red", line_width=2)
+    fig_plotly.update_layout(
+        height=350,
+        dragmode="select",
+        xaxis_title="Step",
+        hovermode="x",
+    )
+    fig_plotly.update_xaxes(showspikes=True, spikemode="across", spikesnap="cursor", showline=True)
+    st.plotly_chart(
+        fig_plotly,
+        width="stretch",
+        key=f"mcap_signal_plot_{st.session_state.current_episode_key}",
+    )
 
 
-_playback_fragment()
+_inspection_fragment()
 
 # =========================================================
 # 拆分 Data Health -> Image Health / Joint Health
@@ -1012,12 +825,15 @@ image_health_rows = [r for r in health_rows if r["topic"].startswith("camera:")]
 joint_health_rows = [r for r in health_rows if not r["topic"].startswith("camera:")]
 
 st.markdown("#### Image Health")
-st.dataframe(
-    image_health_rows,
-    width="stretch",
-    hide_index=True,
-    height=min(1200, 38 + 35 * max(len(image_health_rows), 1)),
-)
+if image_health_rows:
+    st.dataframe(
+        image_health_rows,
+        width="stretch",
+        hide_index=True,
+        height=min(1200, 38 + 35 * len(image_health_rows)),
+    )
+else:
+    st.caption("本段没有解析到配置的相机图像。")
 
 # 只给数字看不到位置，没法去 Playback 的 Step 滑条对着核实——补一张丢帧位置明细表，
 # 不用图表（避免重蹈"图和表对不上"的观感问题），直接给 step 区间，方便拖到那一段验证。

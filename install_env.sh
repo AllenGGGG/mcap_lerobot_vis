@@ -19,6 +19,11 @@ else
     echo "Conda 环境已存在：$ENV_NAME"
 fi
 
+# MCAP playback uses H.264 previews in the same browser player as LeRobot.
+if ! "$CONDA_BIN" run -n "$ENV_NAME" --no-capture-output ffmpeg -version >/dev/null 2>&1; then
+    "$CONDA_BIN" install -n "$ENV_NAME" -c conda-forge ffmpeg -y
+fi
+
 # Pin the application stack so a new machine gets the same versions as the
 # working visualizer environment. Transitive dependencies are resolved by pip.
 packages=(
