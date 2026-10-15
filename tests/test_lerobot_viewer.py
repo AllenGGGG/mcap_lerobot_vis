@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 from streamlit.testing.v1 import AppTest
 
-from test_mcap_viewer import trace_values
+from test_mcap_viewer import trace_values, plot_traces
 
 
 APP = Path(__file__).resolve().parents[1] / "lerobot_vis.py"
@@ -40,7 +40,7 @@ class LeRobotSignalTest(unittest.TestCase):
             app.sidebar.text_input[0].set_value(str(root)).run()
             self.assertFalse(app.exception)
             self.assertFalse(app.error)
-            traces = {t["name"]: t for t in json.loads(app.get("plotly_chart")[0].proto.spec)["data"]}
+            traces = plot_traces(app)
             np.testing.assert_allclose(trace_values(traces["S:left_joint1"]), np.arange(steps))
             np.testing.assert_allclose(trace_values(traces["A:left_joint1"]), np.arange(steps) + .25)
             if steps > 1:

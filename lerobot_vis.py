@@ -15,6 +15,7 @@ import streamlit as st
 import plotly.graph_objects as go
 from smooth_player import (show_smooth_player, select_signal_dimensions, SIGNAL_PALETTE,
                            lighter_signal_color as _lighter_hex_color)
+from signal_plot import show_signal_plot
 
 st.set_page_config(page_title="VLA Episode Viewer (LeRobot)", layout="wide")
 
@@ -558,7 +559,7 @@ def _inspection_fragment():
     fig.add_vline(x=t, line_color="red", line_width=2)
     fig.update_layout(height=350, dragmode="select", xaxis_title="Step", hovermode="x")
     fig.update_xaxes(showspikes=True, spikemode="across", spikesnap="cursor", showline=True)
-    st.plotly_chart(fig, width="stretch", key=f"lr_signal_plot_{st.session_state.lr_episode_key}")
+    show_signal_plot(fig, key="lr_signal_plot")
 
 
 _inspection_fragment()

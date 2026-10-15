@@ -16,6 +16,7 @@ from mcap_ros2.decoder import DecoderFactory
 from smooth_player import (select_signal_dimensions, SIGNAL_PALETTE,
                            lighter_signal_color as _lighter_hex_color)
 from mcap_video import show_mcap_smooth_player
+from signal_plot import show_signal_plot
 from mcap_joint_signals import (
     COMMAND_TOPICS, NAMES_TOPIC, JOINT_TOPIC, CommandDecoder,
     joint_positions, signal_identity, display_label,
@@ -793,11 +794,7 @@ def _inspection_fragment():
         hovermode="x",
     )
     fig_plotly.update_xaxes(showspikes=True, spikemode="across", spikesnap="cursor", showline=True)
-    st.plotly_chart(
-        fig_plotly,
-        width="stretch",
-        key=f"mcap_signal_plot_{st.session_state.current_episode_key}",
-    )
+    show_signal_plot(fig_plotly, key="mcap_signal_plot")
 
 
 _inspection_fragment()

@@ -1,6 +1,7 @@
 """Match the full and names/values command formats found in real recordings."""
 import base64
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -98,6 +99,16 @@ def trace_values(trace):
     return np.array(values, dtype=float)
 
 
+def plot_traces(app):
+    for frame in app.get("iframe"):
+        page = frame.proto.srcdoc
+        match = re.search(r'Plotly\.newPlot\(\s*"[^"]+",\s*', page)
+        if match:
+            traces, _ = json.JSONDecoder().raw_decode(page[match.end():])
+            return {trace["name"]: trace for trace in traces}
+    raise AssertionError("Signal plot not rendered")
+
+
 class McapViewerTest(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -111,7 +122,7 @@ class McapViewerTest(unittest.TestCase):
         return app
 
     def traces(self, app):
-        return {trace["name"]: trace for trace in json.loads(app.get("plotly_chart")[0].proto.spec)["data"]}
+        return plot_traces(app)
 
     def check_joint_pairs(self, mode):
         folder = self.root / "episode" / "recording"
